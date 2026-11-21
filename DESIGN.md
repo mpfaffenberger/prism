@@ -247,9 +247,9 @@ simplification, it is dropped, since those can never block. Until Nov 21 2026 ev
 at 9 and 10 minutes a lens's last report landed seconds before the hard stop, and 7 of 9 live reviews
 ended with no verdict.
 
-The **hard deadline** (`PRISM_HARD_DEADLINE_MINUTES`, at most 20 per attempt) is the backstop: the job
-cancels whatever still runs (posting, say): "Review timed out", no verdict, and findings already posted
-stay. A review whose correctness or security lens was cut short, left a candidate unchecked, or failed
+The **hard deadline** (`PRISM_HARD_DEADLINE_MINUTES`, at most 20 per attempt) is the backstop. The job
+cancels whatever still runs, for example a post that has not returned. The attempt ends with "Review timed
+out" and no verdict, and findings already posted stay. A review whose correctness or security lens was cut short, left a candidate unchecked, or failed
 outright (a model error after the client's retries), **never approves**: it requests changes if it found
 blocking issues, and otherwise
 posts a neutral COMMENT ("partially reviewed") with a neutral check, and isn't remembered for continuing

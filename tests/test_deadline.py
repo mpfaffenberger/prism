@@ -363,6 +363,38 @@ async def test_what_was_confirmed_before_the_cutoff_still_blocks(repo: GitRepo, 
     assert [c.line for c in github.inline_comments] == [5]
 
 
+async def test_an_earlier_verdict_does_not_stand_in_for_its_unchecked_replacement(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: a more urgent report for a line replaces the judged one. If only the
+    replacement is still unjudged at the cutoff, the review must not approve over it."""
+
+    async def lens(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        answered = sum(isinstance(message, ModelResponse) for message in messages)
+        if answered == 0:
+            return ModelResponse(parts=[ToolCallPart(REPORT_TOOL, {"finding": finding(5, priority=3)})])
+        if answered == 1:
+            await asyncio.sleep(0.3)  # the first report's verdict is in before the second is made
+            return ModelResponse(parts=[ToolCallPart(REPORT_TOOL, {"finding": finding(5, priority=1)})])
+        report = {"findings": [], "overall_correct": False, "reviewed": ["stats.py"]}
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, report)])
+
+    github = FakeGitHub(repo)
+    deps = cut_off(
+        github,
+        tmp_path,
+        agents=lambda ws: (
+            correctness_agent(FunctionModel(lens), ws),
+            verifier_agent(verifier_model(lambda f: True, stuck=lambda f: f["priority"] == 1), ws),
+        ),
+    )
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("neutral", "Partially reviewed")
+    [review] = github.reviews
+    assert review["event"] == "COMMENT" and "Not checked before the time limit: `stats.py:5`." in review["body"]
+
+
 async def test_an_advisory_check_unfinished_at_the_cutoff_does_not_withhold_approval(
     repo: GitRepo, tmp_path: Path
 ) -> None:
