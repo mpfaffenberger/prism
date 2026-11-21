@@ -39,6 +39,7 @@ class ModelPool:
     Within a construction burst each stage also counts its own placements:
     finders start first, and an unstarted verifier need not displace a finder.
     These short-lived estimates may overlap real load but never block a caller.
+    With a dedicated checker (`checks: "checker"`), the pool places only finders (see `check`).
     """
 
     def __init__(self, config: PrismConfig):
@@ -47,6 +48,7 @@ class ModelPool:
         self._resources = [_Resource(spec, capacity, config.resolve(spec)) for spec, capacity in config.pool.items()]
         if len({resource.choice[0].model_name for resource in self._resources}) < 2:
             raise ValueError("pool needs two different resolved model names for independent verification")
+        self._checker = config.resolve(config.checker) if config.checks == "checker" else None
         self._lock = Lock()
         self._expires = 0.0
         self._finders: dict[str, int] = {}
@@ -54,6 +56,13 @@ class ModelPool:
 
     def key(self, model: Model) -> str:
         return next(resource.spec for resource in self._resources if resource.choice[0] is model)
+
+    def check(self, finder: str) -> Choice:
+        """Place a check of findings by the model named `finder`: on the dedicated checker if there is one, unless
+        it is the finder's own model; then, like every check without one, on another pool model."""
+        if self._checker is not None and self._checker[0].model_name != finder:
+            return self._checker
+        return self.choose(excluding=finder)
 
     def choose(self, *, excluding: str | None = None) -> Choice:
         """Place a new run, excluding the originating finder when placing a check."""
