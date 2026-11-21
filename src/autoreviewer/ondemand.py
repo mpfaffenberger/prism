@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from autoreviewer.github import PublicGitHub, PullRequestReader, Repo
-from autoreviewer.review.deadline import Deadline
+from autoreviewer.review.deadline import Deadline, checking_cutoff
 from autoreviewer.review.job import AgentFactory, CheckResult, Lens, Reviewed, review_change
 from autoreviewer.review.pipeline import BLOCK_AT_PRIORITY, Outcome
 from autoreviewer.review.render import comment_body
@@ -157,7 +157,9 @@ def run(argv: list[str] | None = None) -> int:
             block_at=settings.block_at_priority,
             simplifier=simplifier_agents(plan) if settings.simplify else None,
             lenses=build_lenses(settings, plan),
-            deadline=Deadline(settings.soft_deadline_minutes * 60),
+            deadline=Deadline(
+                settings.soft_deadline_minutes * 60, checking_s=checking_cutoff(settings.hard_deadline_minutes * 60)
+            ),
         )
         report = asyncio.run(asyncio.wait_for(review, settings.hard_deadline_minutes * 60))
     except Exception as error:  # any failure is an error, never a verdict

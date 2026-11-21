@@ -234,11 +234,24 @@ Every lens gets one shared scope rule (`agents.FOCUS`): review the lines the PR 
 affect, and read the rest of the codebase only to understand them. Runaway reviews were scope drift, or a model stuck in a loop: verifiers get an 80-step budget
 and every agent the harness's `DetectLoops`, so the deadlines are only a backstop.
 
-`review/deadline.py`: the **soft deadline** defaults to 9 minutes (`PRISM_SOFT_DEADLINE_MINUTES`),
-capped at 90% of the hard deadline. With five minutes left, lenses are asked to focus; with one minute
-left, they lose their tools and must report what they found. Both windows shrink for shorter budgets. After the **hard deadline** (`PRISM_HARD_DEADLINE_MINUTES`, at most 10 per attempt) the job cancels the review:
-"Review timed out", no verdict, and findings already posted stay. A review whose correctness or security lens was cut short, or failed outright (a model error after the
-client's retries), **never approves**: it requests changes if it found blocking issues, and otherwise
+`review/deadline.py`: the **soft deadline** defaults to 15 minutes (`PRISM_SOFT_DEADLINE_MINUTES`),
+capped at three quarters of the hard deadline so checking keeps its share. With five minutes left, lenses
+are asked to focus; with one minute left, they lose their tools and must report what they found. Both
+windows shrink for shorter budgets.
+
+The **checking cutoff** comes a minute before the hard deadline. Checking stops waiting there, and the
+verdict is posted from what was judged by then. A lens that still hasn't reported counts as cut short.
+A candidate still unjudged is never posted: from correctness or security it is recorded as unchecked,
+its location (not its text) is listed, and the review can't approve; from an advisory lens, or a
+simplification, it is dropped, since those can never block. Until Nov 21 2026 every check was awaited:
+at 9 and 10 minutes a lens's last report landed seconds before the hard stop, and 7 of 9 live reviews
+ended with no verdict.
+
+The **hard deadline** (`PRISM_HARD_DEADLINE_MINUTES`, at most 20 per attempt) is the backstop: the job
+cancels whatever still runs (posting, say): "Review timed out", no verdict, and findings already posted
+stay. A review whose correctness or security lens was cut short, left a candidate unchecked, or failed
+outright (a model error after the client's retries), **never approves**: it requests changes if it found
+blocking issues, and otherwise
 posts a neutral COMMENT ("partially reviewed") with a neutral check, and isn't remembered for continuing
 (files it never read wouldn't count as changed since). The CLI exits 3 for it, and the evals use the
 bot's limits.

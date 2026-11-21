@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import get_args
 
 from autoreviewer.github import PullRequestState, Repo
-from autoreviewer.review.deadline import Deadline
+from autoreviewer.review.deadline import Deadline, checking_cutoff
 from autoreviewer.review.job import AgentFactory, CheckResult, Lens, ReviewDeps, Reviewed, review_change
 from autoreviewer.review.schemas import Finding, LensKind
 from autoreviewer.web.app import ModelPlan, correctness_agents, lens, lens_agents
@@ -145,7 +145,7 @@ async def run_case(
                 result = await review_change(
                     reader=FakeGitHub(repo), source=LocalSource(repo), agents=agents, work_dir=Path(scratch),
                     repo=Repo(0, "eval", case.name), number=1, state=state, head_sha=repo.head, lenses=lenses,
-                    deadline=Deadline(soft_s),
+                    deadline=Deadline(soft_s, checking_s=checking_cutoff(hard_s)),
                 )  # fmt: skip
         except TimeoutError:
             return Result(case.name, case.clean, False, False, 0, 0, 0, time.monotonic() - started, "timed out")

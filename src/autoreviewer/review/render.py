@@ -81,13 +81,19 @@ def review_body(outcome: Outcome, *, footer: str) -> str:
         if outcome.standing
         else ""
     )
+    # Where the unchecked candidates are, without their text: an unverified claim is never posted.
+    unchecked = (
+        f"Not checked before the time limit: {', '.join(f'`{f.path}:{f.line}`' for f in outcome.unchecked)}.\n\n"
+        if outcome.unchecked
+        else ""
+    )
     if not posted:
         found = "No new issues found" if standing else "No issues found"
         where = " in the part reviewed" if cut_short else ""
-        return f"{cut_short}{standing}{found}{where}.\n\n{footer}"
+        return f"{cut_short}{unchecked}{standing}{found}{where}.\n\n{footer}"
     blocking = [f for f in posted if outcome.is_blocking(f)]
     advisory = [f for f in posted if not outcome.is_blocking(f)]
-    lines = [note.rstrip() for note in (cut_short, standing) if note]
+    lines = [note.rstrip() for note in (cut_short, unchecked, standing) if note]
     if blocking:
         lines.append(f"Found {_count(blocking)} to fix before merging.")
     simplify = [f for f in advisory if f.kind == "simplify"]

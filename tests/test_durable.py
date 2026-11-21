@@ -163,7 +163,7 @@ async def test_a_request_after_timeout_gets_a_new_check_and_clock(
     pull = pull_for(github.repo)
     clock = durable.time
     with monkeypatch.context() as patch:
-        patch.setattr(durable, "time", lambda: clock() + 601)
+        patch.setattr(durable, "time", lambda: clock() + job.MAX_REVIEW_S + 1)
         original = await durable.enqueue(pull)
         assert (await original.get_result()).title == "Review timed out"
     assert await durable.enqueue_review(pull) is True  # a redelivered push: finished, left alone
@@ -171,9 +171,9 @@ async def test_a_request_after_timeout_gets_a_new_check_and_clock(
     # Make the persisted start genuinely old: inheriting step 1 would immediately time out again.
     with sqlite3.connect(tmp_path / "dbos.sqlite") as db:
         db.execute(
-            "UPDATE operation_outputs SET started_at_epoch_ms = started_at_epoch_ms - 601000 "
+            "UPDATE operation_outputs SET started_at_epoch_ms = started_at_epoch_ms - ? "
             "WHERE workflow_uuid = ? AND function_id = 1",
-            (original.workflow_id,),
+            (int((job.MAX_REVIEW_S + 1) * 1000), original.workflow_id),
         )
     assert not await durable.enqueue_review(pull, comment_id=99)
     retry = await DBOS.retrieve_workflow_async(f"{original.workflow_id}:attempt:2")

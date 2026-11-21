@@ -133,6 +133,12 @@ def _prompt(messages: list[ModelMessage]) -> str:
     )
 
 
+async def never_answers(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """A model call that never returns: work the deadline has to cut off."""
+    await asyncio.Event().wait()
+    raise AssertionError("cancelled before this")
+
+
 def lens_model(findings: list[dict[str, Any]]) -> FunctionModel:
     return FunctionModel(
         lambda messages, info: _final(info, {"findings": findings, "overall_correct": not findings, "reviewed": []})
@@ -143,9 +149,15 @@ def verifier_model(
     confirm: Callable[[dict[str, Any]], bool],
     priority: Callable[[dict[str, Any]], int | None] = lambda f: None,
     explanation: Callable[[dict[str, Any]], str | None] = lambda f: None,
+    *,
+    stuck: Callable[[dict[str, Any]], bool] = lambda f: False,
 ) -> FunctionModel:
-    def decide(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Confirms what `confirm` says; a finding `stuck` picks never gets its verdict."""
+
+    async def decide(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         reported = json.loads(_prompt(messages).split("```json\n", 1)[1].split("\n```", 1)[0])
+        if stuck(reported):
+            return await never_answers(messages, info)
         ok = confirm(reported)
         verdict = {"confirmed": ok, "reason": "checked the code" if ok else "not a real bug"}
         if ok and (adjusted := priority(reported)) is not None:

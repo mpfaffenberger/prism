@@ -21,6 +21,7 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability
 
 from autoreviewer.review.agents import LENS_LIMITS
+from autoreviewer.review.deadline import Deadline, before_cutoff, until_cutoff
 from autoreviewer.review.diff import added_lines
 from autoreviewer.review.pipeline import (
     CheckAgent,
@@ -74,13 +75,22 @@ async def suggest(
     paths: Collection[str] | None = None,
     publish: Publish | None = None,
     capabilities: Sequence[AbstractCapability[None]] = (),
+    deadline: Deadline | None = None,
 ) -> list[Finding]:
     """Checked suggestions for the PR's added lines, limited to `paths` if given (e.g. what changed since
     the last review, so each push doesn't repeat the same suggestions). Never raises: suggestions are
     optional, so any failure here costs only them, never the review."""
     try:
         run = await simplify(
-            pr, simplifier, root, progress, paths=paths, publish=publish, capabilities=capabilities, sessions=sessions
+            pr,
+            simplifier,
+            root,
+            progress,
+            paths=paths,
+            publish=publish,
+            capabilities=capabilities,
+            sessions=sessions,
+            deadline=deadline,
         )
         return run.posted
     except Exception:
@@ -98,20 +108,28 @@ async def simplify(
     paths: Collection[str] | None = None,
     publish: Publish | None = None,
     capabilities: Sequence[AbstractCapability[None]] = (),
+    deadline: Deadline | None = None,
 ) -> SimplifyRun:
-    """One unguarded pass with its full accounting (the eval reads it; the bot uses `suggest`)."""
+    """One unguarded pass with its full accounting (the eval reads it; the bot uses `suggest`). At the
+    `deadline`'s checking cutoff it stops: suggestions are optional, so the unchecked ones are just not posted."""
     result = SimplifyRun()
     scoped = [change for change in pr.reviewable if paths is None or change.path in paths]
     if not scoped:
         return result
     history = await sessions.history("simplify", simplifier.propose) if sessions else None
-    run = await simplifier.propose.run(
-        finder_prompt(lens_prompt(replace(pr, reviewable=scoped)), history),
-        message_history=history,
-        workspace=current_workspace(history),
-        usage_limits=LENS_LIMITS,
-        capabilities=[*capabilities, progress.watch("simplifier")],
+    run = await before_cutoff(
+        deadline,
+        simplifier.propose.run(
+            finder_prompt(lens_prompt(replace(pr, reviewable=scoped)), history),
+            message_history=history,
+            workspace=current_workspace(history),
+            usage_limits=LENS_LIMITS,
+            capabilities=[*capabilities, progress.watch("simplifier")],
+        ),
     )
+    if run is None:
+        progress.note("simplifications not proposed in time")
+        return result
 
     if sessions:
         sessions.record("simplify", simplifier.propose, run.all_messages())
@@ -162,7 +180,14 @@ async def simplify(
         if publish is not None:
             await publish(finding)
 
-    await asyncio.gather(*(check(suggestion) for suggestion in accepted))
+    checks = [asyncio.create_task(check(suggestion)) for suggestion in accepted]
+    try:
+        if cut := await until_cutoff(deadline, checks):
+            progress.note(f"{len(cut)} simplification(s) not checked in time")
+    except BaseException:
+        for task in checks:
+            task.cancel()
+        raise
     return result
 
 

@@ -28,7 +28,7 @@ from autoreviewer.github import (
     Repo,
     ReviewEvent,
 )
-from autoreviewer.review.deadline import DEFAULT_SOFT_S, MAX_REVIEW_S, Deadline
+from autoreviewer.review.deadline import DEFAULT_SOFT_S, MAX_REVIEW_S, Deadline, checking_cutoff
 from autoreviewer.review.diff import MAX_CHANGED_LINES, added_lines, select
 from autoreviewer.review.lint import LINT_KINDS, MAX_LINT_FINDINGS, LintError, lint_findings
 from autoreviewer.review.memory import PriorReview, ReviewMemory, conversation_id
@@ -103,6 +103,7 @@ async def _run_lens(
         capabilities=[deadline.watch(spec.kind)] if deadline else (),
         max_posted=spec.max_posted,
         sessions=sessions,
+        deadline=deadline,
     )
 
 
@@ -234,7 +235,7 @@ async def review_and_post(
     hard_s = min(deps.hard_deadline_s, MAX_REVIEW_S)
     budget = hard_s if remaining_s is None else min(hard_s, remaining_s)
     elapsed = hard_s - budget
-    deadline = Deadline(deps.soft_deadline_s, started=time.monotonic() - elapsed)
+    deadline = Deadline(deps.soft_deadline_s, started=time.monotonic() - elapsed, checking_s=checking_cutoff(hard_s))
     progress = Progress()
     repo = repo_of(pull)
     result: CheckResult | None = None
@@ -426,6 +427,7 @@ async def review_change(
                         checked=linted,
                         progress=progress,
                         publish=publish,
+                        deadline=deadline,
                     ),
                     # Continuing, it covers only what it re-read: the files changed since its last review.
                     [change.path for change in (pr if scope is None else _only(pr, scope)).reviewable],
@@ -459,6 +461,7 @@ async def review_change(
                         sessions=sessions,
                         publish=publish,
                         capabilities=[deadline.watch("simplifier")] if deadline else (),
+                        deadline=deadline,
                     )
                 )
         outcome = correctness.result()
@@ -481,9 +484,11 @@ async def review_change(
     )
     blocking_lenses = {"reviewer", *(spec.kind for spec in lenses if spec.kind not in ADVISORY_KINDS)}
     timed_out = deadline is not None and bool(deadline.wrapped_up & blocking_lenses)
-    outcome.cut_short = timed_out or bool(outcome.failed_blocking)
+    # A lens that can block and didn't finish, or whose candidates weren't all judged, never approves.
+    outcome.cut_short = timed_out or bool(outcome.failed_blocking) or bool(outcome.cut - ADVISORY_KINDS)
     if deadline is not None:
         outcome.uncover("correctness" if lens == "reviewer" else lens for lens in deadline.wrapped_up)
+    outcome.uncover(outcome.cut)  # an unjudged candidate may be a finding that still stands: nothing is "fixed"
     # A capped lens verifies only its best candidates and drops the rest: at its cap, it may have dropped one.
     caps = {"correctness": MAX_FINDINGS, **{spec.kind: spec.max_posted for spec in lenses}}
     outcome.uncover(kind for kind, cap in caps.items() if sum(f.kind == kind for f in outcome.reported) >= cap)

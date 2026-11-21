@@ -25,15 +25,17 @@ def with_lenses(**switches: bool) -> Settings:
 
 def test_the_bots_time_limits_come_from_its_env() -> None:
     """From the bot's review of #47: Settings.from_env reads them through config.deadlines_from."""
-    assert (Settings.from_env(ENV).soft_deadline_minutes, Settings.from_env(ENV).hard_deadline_minutes) == (9, 10)
+    assert (Settings.from_env(ENV).soft_deadline_minutes, Settings.from_env(ENV).hard_deadline_minutes) == (15, 20)
     limits = {"PRISM_SOFT_DEADLINE_MINUTES": "3", "PRISM_HARD_DEADLINE_MINUTES": "7"}
     settings = Settings.from_env({**ENV, **limits})
     assert (settings.soft_deadline_minutes, settings.hard_deadline_minutes) == (3, 7)
 
 
 def test_deadlines_cap_hard_and_reserve_time_after_soft() -> None:
-    assert deadlines_from({"PRISM_SOFT_DEADLINE_MINUTES": "20", "PRISM_HARD_DEADLINE_MINUTES": "40"}) == (9, 10)
-    assert deadlines_from({"PRISM_HARD_DEADLINE_MINUTES": "5"}) == (4.5, 5)
+    # 30/50 is what the reference deployment's env file still says: the cap and the checking share both apply.
+    assert deadlines_from({"PRISM_SOFT_DEADLINE_MINUTES": "30", "PRISM_HARD_DEADLINE_MINUTES": "50"}) == (15, 20)
+    assert deadlines_from({"PRISM_HARD_DEADLINE_MINUTES": "5"}) == (3.75, 5)
+    assert deadlines_from({"PRISM_SOFT_DEADLINE_MINUTES": "9", "PRISM_HARD_DEADLINE_MINUTES": "10"}) == (7.5, 10)
 
 
 @pytest.mark.parametrize("key", ["PRISM_SOFT_DEADLINE_MINUTES", "PRISM_HARD_DEADLINE_MINUTES"])

@@ -10,7 +10,7 @@
 
 ## On a pull request
 
-Each review attempt gets at most **10 minutes of review time** from the start of its GitHub check. Waiting in the queue does not count; restarting the receiver does not reset the clock. Slow GitHub delivery or retrying the final check update can delay when the verdict appears. If a blocking review runs out of time it never approves.
+Each review attempt gets at most **20 minutes** from the start of its GitHub check. Waiting in the queue does not count; restarting the receiver does not reset the clock. Slow GitHub delivery or retrying the final check update can delay when the verdict appears. Reviewers wrap up after 15 minutes, and about a minute before the limit Prism stops checking and posts its verdict from what it has confirmed by then. A correctness or security candidate it had no time to check is never posted and never approved over: the review ends as partially reviewed. An unchecked advisory suggestion is dropped.
 
 Prism reads the diff **and the code around it**. When the finder flags a correctness bug, a separate checker checks whether the claim holds up in the repository before it becomes an inline finding. The models don't hold GitHub credentials; application code posts the review and sets the verdict.
 

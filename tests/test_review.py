@@ -233,8 +233,9 @@ async def test_expiring_after_a_blocking_verdict_preserves_the_failed_check(
 
     cleanup = AsyncMock(side_effect=hang)
     monkeypatch.setattr(f"autoreviewer.review.job.{hung}", cleanup)
+    deps = replace(job_deps(github, tmp_path, [finding(5)]), hard_deadline_s=1.5)  # the hung cleanup outlasts it
     async with asyncio.timeout(5):
-        result = await review_and_post(job_deps(github, tmp_path, [finding(5)]), pull(repo), 1, remaining_s=1)
+        result = await review_and_post(deps, pull(repo), 1)
 
     cleanup.assert_awaited_once()
     assert [r["event"] for r in github.reviews] == ["REQUEST_CHANGES"]
