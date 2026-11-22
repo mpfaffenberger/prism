@@ -491,8 +491,7 @@ async def _run_judged(
     judged, and `label` joins the lenses that were cut off, since it never said what it covered."""
     try:
         result = await before_cutoff(deadline, lambda: run([judge.toolset()] if report_as_you_go else []))
-        if result is None:
-            assert deadline is not None  # only its cutoff makes before_cutoff give None
+        if result is None and deadline is not None:
             deadline.wrapped_up.add(label)
         await judge.finish(result.output.findings if result else [])
     except BaseException:
