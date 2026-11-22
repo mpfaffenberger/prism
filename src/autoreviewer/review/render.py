@@ -43,8 +43,9 @@ def code_span(text: str, *, limit: int = MAX_TEXT, suffix: str = "") -> str:
     """`text` as an inline code span that nothing inside it can close. A PR's author chooses its file names, so
     a path may hold backticks or line breaks meant to break out and plant links or mentions in the bot's review.
 
+    Line breaks and tabs become a space; spaces stay as they are, so the name shown is the file's name.
     `text` is clipped to `limit`; `suffix` is our own text, added after the clip so it is never cut."""
-    text = sanitize(" ".join(text.split()), limit=limit) + suffix
+    text = sanitize(re.sub(r"[^\S ]+", " ", text), limit=limit) + suffix
     fence = _fence(text)
     pad = " " if text.startswith("`") or text.endswith("`") else ""
     return f"{fence}{pad}{text}{pad}{fence}"

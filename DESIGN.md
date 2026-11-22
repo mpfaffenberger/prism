@@ -243,10 +243,11 @@ The **checking cutoff** leaves one minute for posting, or one tenth of the hard 
 shorter. Checking stops waiting there, and the
 verdict is posted from what was judged by then. A lens that still hasn't reported counts as cut short.
 A candidate still unjudged is never posted: from correctness or security it is recorded as unchecked,
-its location (not its text) is listed, and the review can't approve; from an advisory lens, or a
+the review lists its location (not its text) and can't approve; from an advisory lens, or a
 simplification, it is dropped, since those can never block. A confirmed finding whose comment is being
-posted finishes posting; one still waiting its turn to post goes into the verdict review instead. Until
-Nov 21 2026 every check was awaited: at 9 and 10 minutes a lens's last report landed seconds before the
+posted finishes posting; one still waiting its turn to post goes into the verdict review instead. The
+check's activity trail is the log of the review, not its findings: it shows what each lens reported, for
+every candidate, whatever became of it. Until Nov 21 2026 every check was awaited: at 9 and 10 minutes a lens's last report landed seconds before the
 hard stop, and 7 of 9 live reviews ended with no verdict.
 
 The **hard deadline** (`PRISM_HARD_DEADLINE_MINUTES`, at most 20 per attempt) is the backstop. The job

@@ -433,7 +433,8 @@ class Judge:
         if not unjudged:
             return
         self._outcome.cut.add(self._kind)
-        # Where and how many, never the claim: the progress trail is published to the check run.
+        # This note says where, as the review will. (The trail above it shows what each lens reported, as it
+        # does for every candidate: it is the log of the review, not its findings.)
         if self._kind in ADVISORY_KINDS:
             self._progress.note(f"{len(unjudged)} {self._kind} candidate(s) not checked in time: dropped")
             return

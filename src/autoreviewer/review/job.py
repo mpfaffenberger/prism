@@ -263,8 +263,8 @@ async def review_and_post(
         logger.warning("reviewing %s/%s#%d at %s timed out", pull.owner, pull.repo, pull.number, pull.head_sha[:7])
         result = CheckResult(
             "Review timed out",
-            f"Stopped after {hard_s / 60:g} minutes, before a verdict. Findings confirmed until then "
-            "are posted as comments. Push again or request another review to retry.",
+            f"Stopped after {hard_s / 60:g} minutes, before a verdict. Comments already posted remain. "
+            "Push again or request another review to retry.",
             "neutral",
         )
     except Exception:

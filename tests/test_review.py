@@ -223,6 +223,8 @@ async def test_a_bug_requests_changes_with_an_inline_comment(repo: GitRepo, tmp_
         ("`x``y`:5", "``` `x``y`:5 ```"),  # padded on both sides: Markdown strips one space from each
         ("end`", "`` end` ``"),
         ("two\nlines.py:5", "`two lines.py:5`"),
+        ("tab\t\r\nhere.py:5", "`tab here.py:5`"),
+        ("two  spaces.py:5", "`two  spaces.py:5`"),  # a file's own spaces are part of its name
     ],
 )
 def test_a_file_name_cannot_close_its_code_span(name: str, span: str) -> None:
@@ -241,6 +243,14 @@ def test_an_unchecked_candidate_on_a_hostile_file_name_stays_inside_its_span() -
     unchecked = Finding.model_validate({**finding(5, path=hostile), "kind": "correctness"})
     body = review_body(Outcome(unverified=[(unchecked, OUT_OF_TIME)], cut_short=True), footer="footer")
     assert f"``{sanitize(hostile)}:5``" in body and "@octocat" not in body  # no ping, and the span holds
+
+
+def test_a_finding_outside_the_diff_on_a_hostile_file_name_stays_inside_its_span() -> None:
+    """From the bot's review of #65: the list of findings outside the changed lines prints file names too."""
+    hostile = "x`[approve](https://evil.example) @octocat `.py"
+    outside = Finding.model_validate({**finding(5, path=hostile), "kind": "correctness"})
+    body = review_body(Outcome(general=[outside]), footer="footer")
+    assert f"- ``{sanitize(hostile)}:5``: " in body and "@octocat" not in body
 
 
 async def test_a_clean_pr_is_approved(repo: GitRepo, tmp_path: Path) -> None:

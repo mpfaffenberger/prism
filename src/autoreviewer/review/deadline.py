@@ -159,12 +159,18 @@ async def until_cutoff[T](
     finishing: Container[object] = (),
 ) -> list[asyncio.Task[T]]:
     """Wait for `tasks` until the checking cutoff, then cancel and return the ones still running. A task
-    that finished with an error raises here, as `asyncio.gather` would.
+    that finished with an error raises here, as `asyncio.gather` would. Past the cutoff, a task that has not
+    begun never does.
 
     A task in `finishing` (see `Finishing`) is left to complete, not cancelled and not returned."""
     if not tasks:
         return []
-    done, pending = await asyncio.wait(tasks, timeout=deadline.checking_remaining if deadline else None)
+    if deadline is not None and deadline.past_cutoff:
+        # No wait at all: even a wait of zero yields to the event loop, which would begin every task not yet begun.
+        pending = {task for task in tasks if not task.done()}
+        done = set(tasks) - pending
+    else:
+        done, pending = await asyncio.wait(tasks, timeout=deadline.checking_remaining if deadline else None)
     cut = [task for task in tasks if task in pending and task not in finishing]
     for task in cut:
         task.cancel()

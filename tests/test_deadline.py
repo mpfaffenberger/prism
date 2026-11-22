@@ -13,7 +13,7 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, Tool
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.tools import ToolDefinition
 
-from autoreviewer.github import PullRequestState
+from autoreviewer.github import PullRequestState, Repo, ReviewComment
 from autoreviewer.review import job
 from autoreviewer.review.agents import REPORT_TOOL, correctness_agent, lens_pair, verifier_agent
 from autoreviewer.review.deadline import (
@@ -432,6 +432,28 @@ async def test_a_confirmed_finding_waiting_its_turn_to_post_at_the_cutoff_goes_i
     assert len(github.review_comments) == 1 and len(review["comments"]) == 1  # each finding posted exactly once
 
 
+async def test_the_hard_stop_keeps_the_comments_already_posted(
+    repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From the bot's review of #65: the backstop still ends a review whose post never returns, without a
+    verdict, and what was posted before it stays."""
+    github = FakeGitHub(repo)
+    post = github.create_review_comment
+
+    async def second_never_returns(repo: Repo, number: int, *, commit_sha: str, comment: ReviewComment) -> None:
+        if github.review_comments:
+            await asyncio.Event().wait()
+        await post(repo, number, commit_sha=commit_sha, comment=comment)
+
+    monkeypatch.setattr(github, "create_review_comment", second_never_returns)
+    deps = replace(job_deps(github, tmp_path, [finding(5), finding(4)]), hard_deadline_s=1.0)
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.title, result.conclusion) == ("Review timed out", "neutral")
+    assert "Comments already posted remain." in result.summary
+    assert len(github.review_comments) == 1 and github.reviews == []
+
+
 async def test_an_earlier_verdict_does_not_stand_in_for_its_unchecked_replacement(
     repo: GitRepo, tmp_path: Path
 ) -> None:
@@ -572,6 +594,15 @@ async def test_work_is_cancelled_at_the_cutoff_and_only_then() -> None:
     tasks = [asyncio.create_task(quick()), asyncio.create_task(forever())]
     assert await until_cutoff(Deadline(soft_s=60, checking_s=0.05), tasks) == [tasks[1]] and tasks[1].cancelled()
     assert await until_cutoff(None, [asyncio.create_task(quick())]) == [] and await until_cutoff(passed, []) == []
+
+    # Nor is a task created just before a wait that starts past the cutoff ever begun.
+    ran: list[str] = []
+
+    async def runs() -> None:
+        ran.append("its first step")
+
+    late = asyncio.create_task(runs())
+    assert await until_cutoff(passed, [late]) == [late] and late.cancelled() and not ran
 
 
 async def test_a_push_mid_review_stops_it_instead_of_finishing(
