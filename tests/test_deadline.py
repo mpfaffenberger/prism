@@ -417,6 +417,21 @@ async def test_a_confirmed_finding_being_posted_at_the_cutoff_is_posted_once_and
     assert len(github.review_comments) == 1 and review["comments"] == []  # posted by itself, not again in the verdict
 
 
+async def test_a_confirmed_finding_waiting_its_turn_to_post_at_the_cutoff_goes_in_the_verdict(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: posts go one at a time. Only the one under way at the cutoff finishes; a
+    second started then would outlast the hard stop and cost the review its verdict."""
+    github = FakeGitHub(repo, comment_delay=3.7)  # the first post ends after checking stops waiting, at 3.6s
+    deps = replace(job_deps(github, tmp_path, [finding(5), finding(4)]), hard_deadline_s=4.0)
+    async with asyncio.timeout(8):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("failure", "2 blocking issue(s)")
+    [review] = github.reviews
+    assert review["event"] == "REQUEST_CHANGES" and "Not checked" not in review["body"]
+    assert len(github.review_comments) == 1 and len(review["comments"]) == 1  # each finding posted exactly once
+
+
 async def test_an_earlier_verdict_does_not_stand_in_for_its_unchecked_replacement(
     repo: GitRepo, tmp_path: Path
 ) -> None:

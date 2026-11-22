@@ -50,7 +50,7 @@ async def test_a_case_cut_short_still_scores_what_it_found(tmp_path: Path, monke
     hit = Finding.model_validate({**finding(5), "kind": "correctness"})
 
     async def review_change(**_: object) -> Reviewed:
-        return Reviewed(Outcome(inline=[hit], cut_short=True), None, None)
+        return Reviewed(Outcome(inline=[hit], cut_short=True), None)
 
     repo = runner.GitRepo(tmp_path, "b" * 40, "a" * 40)
     monkeypatch.setattr(runner, "build_repo", lambda case, parent: (repo, [5]))

@@ -24,6 +24,7 @@ from autoreviewer.github import (
     ReviewRejected,
     ReviewThread,
 )
+from autoreviewer.review.deadline import Deadline
 from autoreviewer.review.pipeline import Outcome, Withdrawal, blocks, blocks_at, normal_title, same_defect
 from autoreviewer.review.render import comment_body, posted_title, review_body
 from autoreviewer.review.schemas import Finding
@@ -154,12 +155,23 @@ def inline_comment(finding: Finding, *, head_sha: str, block_at: int) -> ReviewC
 
 class Publisher:
     """Posts each confirmed inline finding as its own comment, at once. Never raises: a finding that fails to
-    post here goes into the final review instead. Safe to replay: comments already on the PR (found by their
-    fingerprint) aren't posted again."""
+    post here, or whose turn comes after the checking cutoff, goes into the final review instead. Safe to
+    replay: comments already on the PR (found by their fingerprint) aren't posted again."""
 
-    def __init__(self, github: PullRequests, repo: Repo, number: int, *, head_sha: str, author: str, block_at: int):
+    def __init__(
+        self,
+        github: PullRequests,
+        repo: Repo,
+        number: int,
+        *,
+        head_sha: str,
+        author: str,
+        block_at: int,
+        deadline: Deadline | None = None,
+    ):
         self._github, self._repo, self._number = github, repo, number
         self._head_sha, self._author, self._block_at = head_sha, author, block_at
+        self._deadline = deadline
         self.posted: dict[str, int] = {}
         """Fingerprint -> the most urgent priority posted for it (this review, or found on the PR)."""
         self._findings: list[Finding] = []
@@ -197,6 +209,10 @@ class Publisher:
                 # Already posted as at least as urgent by the other lens: a second comment would only repeat it.
                 if any(same_defect(f, finding) and f.priority <= finding.priority for f in self._findings):
                     self.posted[key] = finding.priority
+                    return
+                if self._deadline is not None and self._deadline.past_cutoff:
+                    # Queued behind another post when checking stopped waiting. Each write started now would
+                    # come out of the time kept for the verdict, which carries this finding instead.
                     return
                 comment = inline_comment(finding, head_sha=self._head_sha, block_at=self._block_at)
                 await self._github.create_review_comment(

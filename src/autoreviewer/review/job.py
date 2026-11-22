@@ -557,7 +557,13 @@ async def _review(
     agents, version = deps.select_correctness() if deps.select_correctness else (deps.agents, deps.lens_version)
     conversation = conversation_id(repo, pull.number)
     publisher = Publisher(
-        deps.github, repo, pull.number, head_sha=pull.head_sha, author=deps.bot_login, block_at=deps.block_at
+        deps.github,
+        repo,
+        pull.number,
+        head_sha=pull.head_sha,
+        author=deps.bot_login,
+        block_at=deps.block_at,
+        deadline=deadline,
     )
     try:
         result = await _unless_superseded(

@@ -70,6 +70,11 @@ class Deadline:
             return None
         return max(0.0, self.checking_s - (time.monotonic() - self.started))
 
+    @property
+    def past_cutoff(self) -> bool:
+        """Whether the checking cutoff has come: nothing new is started after it."""
+        return self.checking_remaining == 0
+
     def watch(self, label: str) -> AbstractCapability[None]:
         """Warn the labelled lens as time runs short and force it to report before soft expiry."""
         return _WrapUp(self, label)
@@ -118,10 +123,9 @@ async def before_cutoff[T](deadline: Deadline | None, start: Callable[[], Awaita
     """The result of the work `start` begins, or None if the checking cutoff comes first. Work under way is
     cancelled then, and work not yet begun is never started: a timeout of zero would still let it run to its
     first suspension, far enough to send a model request or even to finish."""
-    remaining = deadline.checking_remaining if deadline else None
-    if remaining is not None and remaining <= 0:
+    if deadline is not None and deadline.past_cutoff:
         return None
-    cutoff = asyncio.timeout(remaining)  # None never expires
+    cutoff = asyncio.timeout(deadline.checking_remaining if deadline else None)  # None never expires
     try:
         async with cutoff:
             return await start()

@@ -214,7 +214,7 @@ async def test_a_stalled_simplification_check_does_not_hold_up_the_verdict(repo:
         working = simplifier([cut()])(workspace)
         return replace(working, check=simplify_checker_agent(FunctionModel(never_answers), workspace))
 
-    deps = replace(job_deps(github, tmp_path, []), simplifier=stalled, hard_deadline_s=1.0)
+    deps = replace(job_deps(github, tmp_path), simplifier=stalled, hard_deadline_s=1.0)
     async with asyncio.timeout(5):
         result = await review_and_post(deps, PullRequestUpdated(1, "mpfaffenberger", "demo", 7, head))
     assert (result.conclusion, result.title) == ("success", "No blocking issues")
