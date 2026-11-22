@@ -36,6 +36,7 @@ from autoreviewer.review.pipeline import (
 from autoreviewer.review.progress import Progress
 from autoreviewer.review.render import has_secret
 from autoreviewer.review.schemas import Finding, SimplifyReport, SimplifyVerdict, Suggestion
+from autoreviewer.review.sessions import run_role
 from autoreviewer.review.workspace import Workspace
 
 if TYPE_CHECKING:
@@ -116,23 +117,25 @@ async def simplify(
     scoped = [change for change in pr.reviewable if paths is None or change.path in paths]
     if not scoped:
         return result
-    history = await sessions.history("simplify", simplifier.propose) if sessions else None
+    propose = simplifier.propose
     run = await before_cutoff(
         deadline,
-        lambda: simplifier.propose.run(
-            finder_prompt(lens_prompt(replace(pr, reviewable=scoped)), history),
-            message_history=history,
-            workspace=current_workspace(history),
-            usage_limits=LENS_LIMITS,
-            capabilities=[*capabilities, progress.watch("simplifier")],
+        lambda: run_role(
+            sessions,
+            "simplify",
+            propose,
+            lambda messages, resuming, recorders: propose.run(
+                None if resuming else finder_prompt(lens_prompt(replace(pr, reviewable=scoped)), messages),
+                message_history=messages,
+                workspace=current_workspace(messages),
+                usage_limits=LENS_LIMITS,
+                capabilities=[*recorders, *capabilities, progress.watch("simplifier")],
+            ),
         ),
     )
     if run is None:
         progress.note("simplifications not proposed in time")
         return result
-
-    if sessions:
-        sessions.record("simplify", simplifier.propose, run.all_messages())
 
     allowed = {change.path for change in scoped}
     accepted: list[Suggestion] = []

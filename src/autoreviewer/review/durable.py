@@ -134,7 +134,9 @@ async def _review_and_post(pull: PullRequestUpdated, check_id: int) -> job.Check
         # Waiting for a worker slot after the check starts spends this attempt's budget.
         elapsed_s = max(0.0, time() - started)
         budget_s = min(deps.hard_deadline_s, job.MAX_REVIEW_S)
-        return await job.review_and_post(deps, pull, check_id, remaining_s=max(0.0, budget_s - elapsed_s))
+        return await job.review_and_post(
+            deps, pull, check_id, remaining_s=max(0.0, budget_s - elapsed_s), attempt=DBOS.workflow_id
+        )
 
 
 @DBOS.step(retries_allowed=True, max_attempts=3)

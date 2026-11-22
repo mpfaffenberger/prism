@@ -29,6 +29,11 @@ def main(argv: list[str] | None = None) -> None:
         metavar="SPEC=CAPACITY",
         help="add a pool model, most preferred first (repeat for each model)",
     )
+    parser.add_argument(
+        "--checks",
+        choices=("pool", "checker"),
+        help="with --pool-model: place checks on the pool (default) or always on --checker",
+    )
     parser.add_argument("--local-context", type=int, metavar="TOKENS", help="served window per local model")
     parser.add_argument("--local-url", metavar="URL", help="default endpoint for local:<id> models")
     parser.add_argument("--finder-url", metavar="URL", help="override the endpoint for a local:<id> finder")
@@ -39,6 +44,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     try:
         pool: dict[str, int] = dict(args.pool_model or [])
+        if args.checks is not None and not pool:
+            parser.error("--checks requires --pool-model")
+        if args.checks == "checker" and args.checker is None:
+            parser.error("--checks checker requires --checker")
         if args.pool_model:
             if len(pool) != len(args.pool_model):
                 parser.error("duplicate --pool-model spec")
@@ -78,6 +87,8 @@ def main(argv: list[str] | None = None) -> None:
         options: dict[str, object] = {"finder": finder, "checker": checker, "overflow": args.overflow, "lanes": lanes}
         if pool:
             options["pool"] = pool
+        if args.checks is not None:
+            options["checks"] = args.checks
         if args.local_context is not None:
             if not endpoints:
                 parser.error("--local-context requires a local model endpoint")

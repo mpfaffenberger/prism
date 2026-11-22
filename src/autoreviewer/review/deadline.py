@@ -9,18 +9,22 @@ hasn't reported, and any candidate still unjudged, is left out, and the verdict 
 was judged by then. The hard deadline (`asyncio.timeout` in the job) is the backstop that cancels
 whatever remains. A review cut short by any of these limits may request changes for what it found,
 but incomplete blocking work never approves.
+
+A run resumed after a restart already carries the notices this attempt gave it, and isn't given them again;
+notices from an earlier attempt, in a continued conversation, don't count.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable, Collection, Container
+from collections.abc import Awaitable, Callable, Collection, Container, Sequence
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 
 from pydantic_ai import RunContext
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelRequest, UserPromptPart
+from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models import ModelRequestContext
 from pydantic_ai.tools import ToolDefinition
 
@@ -75,6 +79,11 @@ class Deadline:
         """Whether the checking cutoff has come: nothing new is started after it."""
         return self.checking_remaining == 0
 
+    @property
+    def began(self) -> datetime:
+        """When this attempt's clock started, in wall-clock time (`started` is monotonic)."""
+        return datetime.now(UTC) - timedelta(seconds=time.monotonic() - self.started)
+
     def watch(self, label: str) -> AbstractCapability[None]:
         """Warn the labelled lens as time runs short and force it to report before soft expiry."""
         return _WrapUp(self, label)
@@ -106,11 +115,28 @@ class _WrapUp(AbstractCapability[None]):
         warning = self._notice()
         if warning is None:
             return request_context
+        if self.last_warning is None:  # resumed after a restart: this attempt may have warned the run already
+            self.last_warning = _last_notice(request_context.messages, since=self.deadline.began)
         last = request_context.messages[-1]
         if isinstance(last, ModelRequest) and warning != self.last_warning:
             last.parts = [*last.parts, UserPromptPart(warning)]
             self.last_warning = warning
         return request_context
+
+
+_NOTICES = frozenset({FIVE_MINUTES, ONE_MINUTE, WRAP_UP})
+
+
+def _last_notice(messages: Sequence[ModelMessage], *, since: datetime) -> str | None:
+    """The newest countdown notice given at or after `since`: one from an earlier attempt doesn't count."""
+    for message in reversed(messages):
+        if isinstance(message, ModelRequest):
+            for part in reversed(message.parts):
+                if not isinstance(part, UserPromptPart) or not isinstance(part.content, str):
+                    continue  # multimodal content is never a notice
+                if part.content in _NOTICES and part.timestamp >= since:
+                    return part.content
+    return None
 
 
 def checking_cutoff(hard_s: float) -> float:

@@ -18,10 +18,12 @@ from dbos import DBOS
 
 from autoreviewer.github import Repo
 from autoreviewer.review import durable, job
+from autoreviewer.review.checkpoints import TurnCheckpoints
+from autoreviewer.review.memory import ReviewMemory, conversation_id
 from autoreviewer.review.posting import Publisher
 from autoreviewer.review.schemas import Finding
 from autoreviewer.web.routing import PullRequestUpdated, ThreadReply
-from tests.review_fakes import BOT, FakeGitHub, GitRepo, finding, job_deps, make_repo
+from tests.review_fakes import BOT, FakeGitHub, GitRepo, finding, git, job_deps, make_repo
 from tests.test_conversation import deps, scripted
 from tests.test_withdrawals import reviewed
 
@@ -245,11 +247,16 @@ async def test_a_retry_forked_by_the_previous_version_is_joined(
     entered, gate, review = asyncio.Event(), asyncio.Event(), job.review_and_post
 
     async def gated(
-        deps: job.ReviewDeps, pull: PullRequestUpdated, check_id: int | None = None, *, remaining_s: float | None = None
+        deps: job.ReviewDeps,
+        pull: PullRequestUpdated,
+        check_id: int | None = None,
+        *,
+        remaining_s: float | None = None,
+        attempt: str | None = None,
     ) -> job.CheckResult:
         entered.set()
         await gate.wait()
-        return await review(deps, pull, check_id, remaining_s=remaining_s)
+        return await review(deps, pull, check_id, remaining_s=remaining_s, attempt=attempt)
 
     monkeypatch.setattr(job, "review_and_post", gated)
     # Step 2 is the review itself: the old retry path forked there, keeping step 1's check run.
@@ -283,25 +290,25 @@ def test_workflow_ids_are_per_head_and_case_insensitive() -> None:
     assert durable.workflow_id(PULL) == durable.workflow_id(shouted)
 
 
+def run_crash_script(directory: Path, mode: str) -> subprocess.CompletedProcess[str]:
+    """One process of a crash scenario (see durable_crash_script.py); its state lives in `directory`."""
+    return subprocess.run(
+        [sys.executable, str(CRASH_SCRIPT), str(directory), mode],
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[1])},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
 @pytest.mark.parametrize("expired", [False, True], ids=["within-budget", "after-deadline"])
 def test_a_review_interrupted_by_a_crash_finishes_after_restart_exactly_once(tmp_path: Path, expired: bool) -> None:
     """Process 1 dies (os._exit) inside the review; process 2 recovers it. One check run, one review."""
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1])}
-
-    def run(mode: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            [sys.executable, str(CRASH_SCRIPT), str(tmp_path), mode],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-
-    first = run("enqueue-and-crash")
+    first = run_crash_script(tmp_path, "enqueue-and-crash")
     assert first.returncode == 9, first.stderr[-2000:]
     assert json.loads((tmp_path / "github.json").read_text())["reviews"] == []  # died before posting
 
-    second = run("recover-after-deadline" if expired else "recover")
+    second = run_crash_script(tmp_path, "recover-after-deadline" if expired else "recover")
     assert second.returncode == 0, second.stderr[-2000:]
 
     state = json.loads((tmp_path / "github.json").read_text())
@@ -311,6 +318,36 @@ def test_a_review_interrupted_by_a_crash_finishes_after_restart_exactly_once(tmp
         assert state["reviews"] == []
     else:
         assert [r["event"] for r in state["reviews"]] == ["REQUEST_CHANGES"]
+
+
+def test_a_review_crashed_between_turns_resumes_at_its_last_completed_turn(tmp_path: Path) -> None:
+    """Issue #60's acceptance test. Process 1's lens reports a finding (turn 1), reads the change (turn 2), and
+    dies in turn 3 once that finding is verified and posted; process 2 recovers the review on the same DB and
+    memory. No completed turn runs again, the finished verdict isn't redone, and one review is posted."""
+    first = run_crash_script(tmp_path, "crash-between-turns")
+    assert first.returncode == 9, first.stderr[-2000:]
+    head = git(tmp_path / "origin", "rev-parse", "HEAD")
+    memory = ReviewMemory(tmp_path / "memory").directory(conversation_id(REPO_, 7))
+    checkpoints = TurnCheckpoints.attempt_directory(memory, durable.workflow_id(pull_for(GitRepo(tmp_path, "", head))))
+    crashed = json.loads((tmp_path / "github.json").read_text())
+    assert crashed["reviews"] == [] and len(crashed["review_comments"]) == 1  # posted the finding, not the verdict
+    assert checkpoints.is_dir()
+
+    second = run_crash_script(tmp_path, "recover")
+    assert second.returncode == 0, second.stderr[-2000:]
+
+    calls = (tmp_path / "calls.log").read_text().splitlines()
+    # Turns 1 and 2 finished before the crash: never sent again. Turn 3 was in flight: sent once more.
+    assert [call for call in calls if call.startswith("lens:")] == ["lens:1", "lens:2", "lens:3", "lens:3"]
+    # Its verdict was checkpointed: neither the replayed report nor the final report verifies it again.
+    assert [call for call in calls if call.startswith("verifier:")] == ["verifier:stats.py:5"]
+
+    state = json.loads((tmp_path / "github.json").read_text())
+    assert [(c["status"], c["conclusion"]) for c in state["checks"]] == [("completed", "failure")]
+    assert [r["event"] for r in state["reviews"]] == ["REQUEST_CHANGES"]
+    inline = [c["comment"] for c in state["review_comments"]] + [c for r in state["reviews"] for c in r["comments"]]
+    assert [(c["path"], c["line"]) for c in inline if finding()["title"] in c["body"]] == [("stats.py", 5)]
+    assert not checkpoints.exists()  # the attempt has its verdict: nothing resumes it again
 
 
 def test_old_sqlite_is_refused_with_a_clear_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,4 +1,7 @@
-"""Bounded, PR-local cache of successful role transcripts. Nothing is published until commit."""
+"""Bounded, PR-local cache of successful role transcripts. Nothing is published until commit.
+
+`run` is how every review role runs: it continues the role's last compatible session and, given this attempt's
+`TurnCheckpoints`, resumes the run's settled turns after a restart."""
 
 from __future__ import annotations
 
@@ -14,6 +17,8 @@ from pathlib import Path
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 from pydantic_ai.models import Model
+
+from autoreviewer.review.checkpoints import Ran, Start, TurnCheckpoints
 
 # Bump for changes to the review runtime/tools that invalidate earlier conversations.
 _RUNTIME = (1, version("pydantic-ai-slim"), version("pydantic-ai-harness"), version("pydantic"))
@@ -52,8 +57,15 @@ def _key[T](namespace: str, base: str, role: str, subject: str, agent: Agent[Non
 
 class RoleSessions:
     def __init__(
-        self, directory: Path, head: str, base: str, compatible: Callable[[str], Awaitable[bool]], namespace: str
+        self,
+        directory: Path,
+        head: str,
+        base: str,
+        compatible: Callable[[str], Awaitable[bool]],
+        namespace: str,
+        turns: TurnCheckpoints | None = None,
     ) -> None:
+        """`turns`: this attempt's checkpoints, so a restart resumes each run instead of repeating it."""
         self._directory = directory / "role-sessions"
         self._path = self._directory / "snapshot"
         self._head = head
@@ -64,6 +76,29 @@ class RoleSessions:
         self._snapshot: dict[str, bytes] | None = None
         self._read_lock = asyncio.Lock()
         self._stamp: tuple[int, int] | None = None
+        self._turns = turns
+
+    async def run[T](
+        self,
+        role: str,
+        agent: Agent[None, T],
+        start: Start[T],
+        *,
+        subject: str = "",
+        history: list[ModelMessage] | None = None,
+        on_resume: Callable[[list[ModelMessage]], None] | None = None,
+    ) -> Ran[T]:
+        """Run `role`: on `history` if given (a continuation), else on its last compatible session; resumed from
+        this attempt's settled turns after a restart; its transcript recorded for the next review."""
+        if history is None:
+            history = await self.history(role, agent, subject=subject)
+        key = _key(self._namespace, self._base, role, subject, agent) if self._turns else None
+        if self._turns is None or key is None:
+            ran = await start(history, False, ())
+        else:
+            ran = await self._turns.run(key, agent, start, history=history, on_resume=on_resume)
+        self.record(role, agent, ran.all_messages(), subject=subject)
+        return ran
 
     def _load(self) -> dict[str, bytes]:
         # One checksummed snapshot: a valid-looking edit to a head, key or message is a miss too.
@@ -160,3 +195,19 @@ class RoleSessions:
             self._snapshot = None
         finally:
             os.close(lock)
+
+
+async def run_role[T](
+    sessions: RoleSessions | None,
+    role: str,
+    agent: Agent[None, T],
+    start: Start[T],
+    *,
+    subject: str = "",
+    history: list[ModelMessage] | None = None,
+    on_resume: Callable[[list[ModelMessage]], None] | None = None,
+) -> Ran[T]:
+    """`RoleSessions.run`, or just the run on `history` when there's no review memory (on-demand reviews)."""
+    if sessions is None:
+        return await start(history, False, ())
+    return await sessions.run(role, agent, start, subject=subject, history=history, on_resume=on_resume)

@@ -3,8 +3,9 @@
 Each PR gets one directory (named by a hash of its conversation id, so repository names can't shape
 paths) holding a harness `FileStepStore` with the lens's message history, and `index.json` naming the
 last *successful* review: which run, which head and merge-base, which prompt/model fingerprint, and the
-findings it posted and dropped. A run that crashed is never resumed from. Closing the PR deletes the
-directory, and with it everything stored about the PR.
+findings it posted and dropped. A run that crashed is never continued by a later commit's review (its own
+attempt resumes it after a restart: see `checkpoints`). Closing the PR deletes the directory, and with it
+everything stored about the PR, checkpoints included.
 
 Lives in the reviewer's own container, never in a sandbox: the history is trusted input to every later
 review of the PR, so it must stay where untrusted code can't touch it.

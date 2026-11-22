@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Self
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -73,6 +73,9 @@ class PrismConfig(BaseModel):
     checker: str
     overflow: str | None = None
     pool: Annotated[dict[str, Annotated[int, Field(gt=0)]], Field(min_length=2)] | None = None
+    checks: Literal["pool", "checker"] = "pool"
+    """Where a pool places checks: on the pool, or on the dedicated `checker` (the pool only places finders then,
+    and checks of a finder on the checker's own model fall back to the pool)."""
     local_context: dict[str, Annotated[int, Field(ge=16)]] = Field(default_factory=dict)
     endpoints: dict[str, str] = Field(default_factory=dict)
     lanes: dict[str, Annotated[int, Field(ge=1)]] = Field(default_factory=dict)
@@ -81,6 +84,8 @@ class PrismConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def default_roles(cls, data: object) -> object:
+        if isinstance(data, dict) and data.get("checks") == "checker" and not data.get("checker"):
+            raise ValueError('checks="checker" needs an explicit checker')
         if isinstance(data, dict) and isinstance(pool := data.get("pool"), dict):
             finder, checker = preferred_roles(pool, data.get("finder"), data.get("checker"))
             return {"finder": finder, "checker": checker, **data}
@@ -116,13 +121,15 @@ class PrismConfig(BaseModel):
         if self.finder == self.checker:
             raise ValueError("finder and checker must use different models")
         pool = self.pool or {}
+        if self.checks == "checker" and not pool:
+            raise ValueError('checks="checker" only applies to a pool')
         for spec, capacity in pool.items():
             check_model_spec(spec)
             if spec in self.lanes and self.lanes[spec] != capacity:
                 raise ValueError(f"lanes for {spec} conflict with pool capacity {capacity}")
         specs = {self.finder, self.checker, *pool}
         if self.overflow is not None:
-            if self.overflow == self.checker:
+            if self.overflow == self.checker and self.checks == "pool":  # with a dedicated checker, the pool checks it
                 raise ValueError("overflow finder and checker must use different models")
             specs.add(self.overflow)
         local_specs = {spec for spec in specs if spec.startswith("local:")}
