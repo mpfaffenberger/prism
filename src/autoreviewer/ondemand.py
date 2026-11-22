@@ -83,7 +83,7 @@ class Report:
             lines.append(f"## `{finding.path}:{finding.line}`\n\n{body}\n")
         if unchecked := outcome.unchecked:
             lines.append(f"**{len(unchecked)} candidate(s) were not checked before the time limit** (never posted):\n")
-            lines.extend(f"- {location(f.path, f.line)} {f.title}" for f in unchecked)
+            lines.extend(f"- {location(f.path, f.line)}" for f in unchecked)  # where, not the unverified claim
             lines.append("")
         if failed := outcome.verifier_failed:
             lines.append(f"**{len(failed)} candidate(s) could not be verified** (the verifier failed):\n")

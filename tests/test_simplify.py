@@ -20,7 +20,7 @@ from autoreviewer.review.pipeline import PullRequestText
 from autoreviewer.review.progress import Progress
 from autoreviewer.review.render import comment_body
 from autoreviewer.review.schemas import Finding
-from autoreviewer.review.simplify import simplify, suggest
+from autoreviewer.review.simplify import Simplifier, simplify, suggest
 from autoreviewer.review.workspace import Workspace
 from autoreviewer.web.routing import PullRequestUpdated
 from tests.review_fakes import FakeGitHub, GitRepo, add_commit, job_deps, never_answers, simplifier
@@ -186,6 +186,23 @@ async def test_simplifications_unfinished_at_the_checking_cutoff_are_not_posted(
     assert found == []
     note = "simplifications not proposed in time" if stuck == "proposer" else "1 simplification(s) not checked in time"
     assert note in progress.activity
+
+
+async def test_a_stalled_simplification_check_does_not_hold_up_the_verdict(repo: GitRepo, tmp_path: Path) -> None:
+    """From the bot's review of #65: the job has to hand its deadline to the simplifier, or an optional
+    suggestion's checker could keep the verdict waiting until the hard stop."""
+    head = add_commit(repo, {"parity.py": BLOATED})
+    github = FakeGitHub(replace(repo, head=head))
+
+    def stalled(workspace: Workspace) -> Simplifier:
+        working = simplifier([cut()])(workspace)
+        return replace(working, check=simplify_checker_agent(FunctionModel(never_answers), workspace))
+
+    deps = replace(job_deps(github, tmp_path, []), simplifier=stalled, hard_deadline_s=1.0)
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, PullRequestUpdated(1, "mpfaffenberger", "demo", 7, head))
+    assert (result.conclusion, result.title) == ("success", "No blocking issues")
+    assert [r["event"] for r in github.reviews] == ["APPROVE"] and github.inline_comments == []
 
 
 async def test_any_failure_costs_only_the_suggestions(tmp_path: Path) -> None:

@@ -249,8 +249,8 @@ at 9 and 10 minutes a lens's last report landed seconds before the hard stop, an
 ended with no verdict.
 
 The **hard deadline** (`PRISM_HARD_DEADLINE_MINUTES`, at most 20 per attempt) is the backstop. The job
-cancels whatever still runs, for example a post that has not returned. The attempt ends with "Review timed
-out" and no verdict, and findings already posted stay. A review whose correctness or security lens was cut short, left a candidate unchecked, or failed
+cancels whatever still runs, for example a post that has not returned. If no verdict was posted, the check
+ends as "Review timed out". Prism keeps any verdict or findings already posted. A review whose correctness or security lens was cut short, left a candidate unchecked, or failed
 outright (a model error after the client's retries), **never approves**: it requests changes if it found
 blocking issues, and otherwise
 posts a neutral COMMENT ("partially reviewed") with a neutral check, and isn't remembered for continuing

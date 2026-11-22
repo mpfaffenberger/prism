@@ -149,9 +149,9 @@ def test_the_report_tells_unchecked_candidates_from_verifier_failures() -> None:
     text = ondemand.Report(REF, "a" * 40, "title", outcome).render()
     unchecked, failed = text.split("could not be verified")
     assert "**1 candidate(s) were not checked before the time limit**" in unchecked
-    assert "`stats.py:5` Not reached in time" in unchecked and "Verifier crashed" not in unchecked
+    assert "- `stats.py:5`\n" in unchecked and "Verifier crashed" not in unchecked
     assert "`stats.py:4` Verifier crashed on this: verification failed: RuntimeError" in failed
-    assert "Not reached in time" not in failed and "PARTIALLY REVIEWED" in text
+    assert "Not reached in time" not in text and "PARTIALLY REVIEWED" in text  # where, never the unverified claim
 
 
 @pytest.mark.usefixtures("cli")

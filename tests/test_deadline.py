@@ -296,8 +296,8 @@ def cut_off(
 ) -> job.ReviewDeps:
     """Deps whose checking cutoff comes after 0.9s (and the hard stop after 1s): fakes answer at once, so only
     work that never answers is still running by then."""
-    deps = replace(job_deps(github, tmp_path, []), hard_deadline_s=1.0, lenses=lenses)
-    return replace(deps, agents=agents) if agents else deps
+    deps = job_deps(github, tmp_path)
+    return replace(deps, agents=agents or deps.agents, hard_deadline_s=1.0, lenses=lenses)
 
 
 async def test_a_lens_stuck_at_the_cutoff_still_gets_a_verdict_from_what_was_judged(
@@ -337,7 +337,8 @@ async def test_a_blocking_candidate_unchecked_at_the_cutoff_is_not_posted_and_no
         result = await review_and_post(deps, pull(repo))
     why = "the review ran out of time before checking 1 candidate finding(s)"
     assert (result.conclusion, result.title) == ("neutral", "Partially reviewed")
-    assert why in result.summary and "1 candidate finding(s) could not be verified" in result.summary
+    assert why in result.summary and "The time limit left 1 candidate finding(s) unchecked." in result.summary
+    assert "will be checked again" not in result.summary  # nothing is saved to recheck it from
     [review] = github.reviews
     assert review["event"] == "COMMENT" and why in review["body"]
     # Where to look, but not the claim: an unverified finding's text is never posted.
@@ -364,6 +365,56 @@ async def test_what_was_confirmed_before_the_cutoff_still_blocks(repo: GitRepo, 
     [review] = github.reviews
     assert review["event"] == "REQUEST_CHANGES" and "`stats.py:4`" in review["body"]
     assert [c.line for c in github.inline_comments] == [5]
+
+
+async def test_an_unchecked_security_candidate_prevents_approval(repo: GitRepo, tmp_path: Path) -> None:
+    """From the bot's review of #65: every lens that can block counts, not correctness alone."""
+    security = Lens(
+        "security", lambda ws: lens_pair("security", lens_model([finding(5)]), FunctionModel(never_answers), ws)
+    )
+    github = FakeGitHub(repo)
+    async with asyncio.timeout(5):
+        result = await review_and_post(cut_off(github, tmp_path, lenses=(security,)), pull(repo))
+    assert (result.conclusion, result.title) == ("neutral", "Partially reviewed")
+    [review] = github.reviews
+    assert review["event"] == "COMMENT" and "Not checked before the time limit: `stats.py:5`." in review["body"]
+    assert github.inline_comments == []
+
+
+async def test_a_candidate_from_a_lens_that_never_finished_is_still_counted_as_unchecked(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: the lens reported it along the way, then never returned its final report,
+    and its verifier never answered either. The candidate must not vanish with the lens."""
+    github = FakeGitHub(repo)
+    deps = cut_off(
+        github,
+        tmp_path,
+        agents=lambda ws: (
+            correctness_agent(FunctionModel(stuck_lens), ws),
+            verifier_agent(FunctionModel(never_answers), ws),
+        ),
+    )
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("neutral", "Partially reviewed")
+    [review] = github.reviews
+    assert review["event"] == "COMMENT" and "Not checked before the time limit: `stats.py:5`." in review["body"]
+
+
+async def test_a_confirmed_finding_being_posted_at_the_cutoff_is_posted_once_and_not_called_unchecked(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: its verdict was in and its comment was on the way to GitHub. Cutting the
+    write off would leave it unrecorded, so the verdict would post the same comment again."""
+    github = FakeGitHub(repo, comment_delay=3.7)  # still posting when checking stops waiting, at 3.6s
+    deps = replace(job_deps(github, tmp_path, [finding(5)]), hard_deadline_s=4.0)
+    async with asyncio.timeout(8):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("failure", "1 blocking issue(s)")
+    [review] = github.reviews
+    assert review["event"] == "REQUEST_CHANGES" and "Not checked" not in review["body"]
+    assert len(github.review_comments) == 1 and review["comments"] == []  # posted by itself, not again in the verdict
 
 
 async def test_an_earlier_verdict_does_not_stand_in_for_its_unchecked_replacement(

@@ -425,12 +425,11 @@ class Judge:
             self.submit(finding)
         if pending := [task for task in self._tasks if not task.done()]:
             self._progress.set_phase(f"Verifying {len(pending)} candidate finding(s)")
-        unjudged = [
-            finding
-            for finding in map(self._tasks.__getitem__, await until_cutoff(self._deadline, self._tasks))
-            # Not one whose verdict was in (cut off while posting), nor one a more urgent report replaced.
-            if (key := (finding.path, finding.line)) not in self._judged and self._latest.get(key) is finding
-        ]
+        # A candidate with its verdict in is only being posted: that write completes, so the comment and the
+        # record of it can't come apart (a cancelled post that still reached GitHub would be posted twice).
+        cut = await until_cutoff(self._deadline, self._tasks, finishing=lambda task: self._key(task) in self._judged)
+        # A report a more urgent one replaced isn't a candidate any more: only its replacement counts.
+        unjudged = [f for f in map(self._tasks.__getitem__, cut) if self._latest.get((f.path, f.line)) is f]
         if not unjudged:
             return
         self._outcome.cut.add(self._kind)
@@ -441,6 +440,10 @@ class Judge:
         for finding in unjudged:
             self._progress.note(f"not checked in time: {finding.path}:{finding.line}")
             self._outcome.unverified.append((finding, OUT_OF_TIME))
+
+    def _key(self, task: asyncio.Task[None]) -> tuple[str, int]:
+        finding = self._tasks[task]
+        return finding.path, finding.line
 
     def cancel(self) -> None:
         for task in self._tasks:

@@ -7,11 +7,14 @@ from pathlib import Path
 import pytest
 
 from autoreviewer.review.deadline import Deadline, checking_cutoff
-from autoreviewer.review.job import CheckResult
+from autoreviewer.review.job import CheckResult, Reviewed
+from autoreviewer.review.pipeline import Outcome
+from autoreviewer.review.schemas import Finding
 from evals import run as runner
 from evals.cases import Case
 from evals.run import arguments, plan_from_env
 from tests.reference_profile import DEEPSEEK, QWEN
+from tests.review_fakes import finding
 from tests.test_reasoning import effort
 
 
@@ -39,6 +42,22 @@ async def test_a_case_runs_under_the_bots_checking_cutoff(tmp_path: Path, monkey
     await runner.run_case(case, lambda workspace: NotImplemented, [], tmp_path, soft_s=300, hard_s=400)
     [deadline] = seen
     assert (deadline.soft_s, deadline.checking_s) == (300, checking_cutoff(400))
+
+
+@pytest.mark.anyio
+async def test_a_case_cut_short_still_scores_what_it_found(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """From the bot's review of #65: a review the cutoff ended early has an outcome, and its hits count."""
+    hit = Finding.model_validate({**finding(5), "kind": "correctness"})
+
+    async def review_change(**_: object) -> Reviewed:
+        return Reviewed(Outcome(inline=[hit], cut_short=True), None, None)
+
+    repo = runner.GitRepo(tmp_path, "b" * 40, "a" * 40)
+    monkeypatch.setattr(runner, "build_repo", lambda case, parent: (repo, [5]))
+    monkeypatch.setattr(runner, "review_change", review_change)
+    case = Case("demo", "stats.py", "old", "new", "A change")
+    result = await runner.run_case(case, lambda workspace: NotImplemented, [], tmp_path, soft_s=300, hard_s=400)
+    assert (result.posted_hit, result.blocking_hit, result.cut_short, result.error) == (True, True, True, None)
 
 
 @pytest.mark.parametrize(

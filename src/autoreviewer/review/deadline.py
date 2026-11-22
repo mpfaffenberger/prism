@@ -131,15 +131,24 @@ async def before_cutoff[T](deadline: Deadline | None, start: Callable[[], Awaita
         return None
 
 
-async def until_cutoff[T](deadline: Deadline | None, tasks: Collection[asyncio.Task[T]]) -> list[asyncio.Task[T]]:
+async def until_cutoff[T](
+    deadline: Deadline | None,
+    tasks: Collection[asyncio.Task[T]],
+    *,
+    finishing: Callable[[asyncio.Task[T]], bool] = lambda task: False,
+) -> list[asyncio.Task[T]]:
     """Wait for `tasks` until the checking cutoff, then cancel and return the ones still running. A task
-    that finished with an error raises here, as `asyncio.gather` would."""
+    that finished with an error raises here, as `asyncio.gather` would.
+
+    A task `finishing` picks is past its decision and only writing it down (posting a confirmed finding, say):
+    it is left to complete, not cancelled and not returned, so the write isn't cut off halfway."""
     if not tasks:
         return []
     done, pending = await asyncio.wait(tasks, timeout=deadline.checking_remaining if deadline else None)
-    for task in pending:
+    cut = [task for task in tasks if task in pending and not finishing(task)]
+    for task in cut:
         task.cancel()
-    await asyncio.gather(*pending, return_exceptions=True)  # let the cancellations land before moving on
+    await asyncio.gather(*pending, return_exceptions=True)  # cancellations land, and what was finishing completes
     for task in done:
         task.result()
-    return [task for task in tasks if task in pending]
+    return cut

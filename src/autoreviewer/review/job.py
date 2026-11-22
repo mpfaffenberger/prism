@@ -689,8 +689,10 @@ def _summary(outcome: Outcome) -> CheckResult:
         notes += f" {len(simplify)} optional simplification(s) suggested."
     if outcome.rejected:
         notes += f" {len(outcome.rejected)} candidate finding(s) were dropped by verification."
-    if outcome.unverified:
-        notes += f" {len(outcome.unverified)} candidate finding(s) could not be verified and will be checked again."
+    if unchecked := outcome.unchecked:
+        notes += f" The time limit left {len(unchecked)} candidate finding(s) unchecked."
+    if failed := outcome.verifier_failed:
+        notes += f" {len(failed)} candidate finding(s) could not be verified and will be checked again."
     if blocking:
         return CheckResult(
             f"{len(blocking)} blocking issue(s)", f"Changes requested; see the review comments.{notes}", "failure"
