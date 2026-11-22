@@ -449,6 +449,35 @@ async def test_an_earlier_verdict_does_not_stand_in_for_its_unchecked_replacemen
     assert review["event"] == "COMMENT" and "Not checked before the time limit: `stats.py:5`." in review["body"]
 
 
+async def test_a_replaced_report_still_being_verified_does_not_hold_the_cutoff_open(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: the replacement's verdict is in, and the report it replaced shares its
+    line. Only a task with its own verdict is left to finish; the stale one is cancelled like any other."""
+
+    async def lens(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        answered = sum(isinstance(message, ModelResponse) for message in messages)
+        if answered < 2:  # first a minor report whose verifier never answers, then a blocking one for the line
+            return ModelResponse(parts=[ToolCallPart(REPORT_TOOL, {"finding": finding(5, priority=3 - 2 * answered)})])
+        report = {"findings": [], "overall_correct": False, "reviewed": ["stats.py"]}
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, report)])
+
+    github = FakeGitHub(repo)
+    deps = cut_off(
+        github,
+        tmp_path,
+        agents=lambda ws: (
+            correctness_agent(FunctionModel(lens), ws),
+            verifier_agent(verifier_model(lambda f: True, stuck=lambda f: f["priority"] == 3), ws),
+        ),
+    )
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("failure", "1 blocking issue(s)")
+    [review] = github.reviews
+    assert review["event"] == "REQUEST_CHANGES" and "Not checked" not in review["body"]
+
+
 async def test_an_advisory_check_unfinished_at_the_cutoff_does_not_withhold_approval(
     repo: GitRepo, tmp_path: Path
 ) -> None:

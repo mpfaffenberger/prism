@@ -373,8 +373,9 @@ class Judge:
         self._reviewable = {change.path for change in pr.reviewable}
         self._slots = asyncio.Semaphore(VERIFY_CONCURRENCY)
         self._tasks: dict[asyncio.Task[None], Finding] = {}
-        self._judged: set[tuple[str, int]] = set()
-        """Lines whose latest finding has its verdict: the cutoff never counts those as unchecked."""
+        self._judged: set[asyncio.Task[None]] = set()
+        """Verifications with their verdict in, which only have their finding left to post. Per task, not per
+        line: a replaced report's task shares its line with the replacement and must not pass for it."""
         self._latest: dict[tuple[str, int], Finding] = {}
         """The most urgent finding reported for each line: only its verdict counts."""
         self._filtered: set[tuple[str, int]] = set()
@@ -403,7 +404,6 @@ class Judge:
         if current is None and len(self._latest) >= self._limit:
             return f"You have reported {self._limit} findings, the most that are checked: not reported."
         if current is not None:  # superseded: its verdict (if any) no longer counts
-            self._judged.discard(key)
             self._outcome.unverified[:] = [(f, why) for f, why in self._outcome.unverified if (f.path, f.line) != key]
             self._outcome.rejected[:] = [(f, why) for f, why in self._outcome.rejected if (f.path, f.line) != key]
         self._latest[key] = finding
@@ -427,7 +427,7 @@ class Judge:
             self._progress.set_phase(f"Verifying {len(pending)} candidate finding(s)")
         # A candidate with its verdict in is only being posted: that write completes, so the comment and the
         # record of it can't come apart (a cancelled post that still reached GitHub would be posted twice).
-        cut = await until_cutoff(self._deadline, self._tasks, finishing=lambda task: self._key(task) in self._judged)
+        cut = await until_cutoff(self._deadline, self._tasks, finishing=self._judged.__contains__)
         # A report a more urgent one replaced isn't a candidate any more: only its replacement counts.
         unjudged = [f for f in map(self._tasks.__getitem__, cut) if self._latest.get((f.path, f.line)) is f]
         if not unjudged:
@@ -440,10 +440,6 @@ class Judge:
         for finding in unjudged:
             self._progress.note(f"not checked in time: {finding.path}:{finding.line}")
             self._outcome.unverified.append((finding, OUT_OF_TIME))
-
-    def _key(self, task: asyncio.Task[None]) -> tuple[str, int]:
-        finding = self._tasks[task]
-        return finding.path, finding.line
 
     def cancel(self) -> None:
         for task in self._tasks:
@@ -465,7 +461,8 @@ class Judge:
         self._progress.note(f"{'confirmed' if verdict.confirmed else 'rejected'}: {finding.title}")
         if self._latest.get((finding.path, finding.line)) is not reported:
             return  # a more urgent report for this line superseded it while it was being verified
-        self._judged.add((finding.path, finding.line))
+        if (task := asyncio.current_task()) is not None:
+            self._judged.add(task)
         if not verdict.confirmed:
             self._outcome.rejected.append((finding, verdict.reason))
             return

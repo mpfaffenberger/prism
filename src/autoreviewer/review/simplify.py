@@ -170,6 +170,10 @@ async def simplify(
             progress.note(f"{'kept' if verdict.confirmed else 'dropped'} simplification: {suggestion.title}")
             return verdict.confirmed
 
+    posting: set[asyncio.Task[None]] = set()
+    """Checks with their verdict in and their suggestion on the way to GitHub: the cutoff lets that post finish,
+    or a post cut off after it reached GitHub would go unrecorded and be posted again with the verdict."""
+
     async def check(suggestion: Suggestion) -> None:
         """Check one suggestion and, if it holds, post it at once."""
         if not await confirmed(suggestion):
@@ -178,11 +182,13 @@ async def simplify(
         finding = _finding(suggestion)
         result.posted.append(finding)
         if publish is not None:
+            if (task := asyncio.current_task()) is not None:
+                posting.add(task)
             await publish(finding)
 
     checks = [asyncio.create_task(check(suggestion)) for suggestion in accepted]
     try:
-        if cut := await until_cutoff(deadline, checks):
+        if cut := await until_cutoff(deadline, checks, finishing=posting.__contains__):
             progress.note(f"{len(cut)} simplification(s) not checked in time")
     except BaseException:
         for task in checks:

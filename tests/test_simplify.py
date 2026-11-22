@@ -188,6 +188,22 @@ async def test_simplifications_unfinished_at_the_checking_cutoff_are_not_posted(
     assert note in progress.activity
 
 
+async def test_a_suggestion_being_posted_at_the_cutoff_finishes_posting(tmp_path: Path) -> None:
+    """From the bot's review of #65: its check was done and its post was under way. Cutting that off would
+    leave a comment GitHub has but the review doesn't know about, to be posted again with the verdict."""
+    posted: list[Finding] = []
+
+    async def publish(finding: Finding) -> None:
+        await asyncio.sleep(0.6)  # still posting when checking stops waiting, at 0.3s
+        posted.append(finding)
+
+    working = simplifier([cut()])(Workspace(tmp_path, "b", "h"))
+    deadline = Deadline(soft_s=60, checking_s=0.3)
+    async with asyncio.timeout(5):
+        found = await suggest(added_file(tmp_path), working, tmp_path, Progress(), publish=publish, deadline=deadline)
+    assert len(found) == 1 and posted == found
+
+
 async def test_a_stalled_simplification_check_does_not_hold_up_the_verdict(repo: GitRepo, tmp_path: Path) -> None:
     """From the bot's review of #65: the job has to hand its deadline to the simplifier, or an optional
     suggestion's checker could keep the verdict waiting until the hard stop."""

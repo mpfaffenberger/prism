@@ -54,8 +54,7 @@ MAX_PATH = 200
 
 def location(path: str, line: int) -> str:
     """Where a finding is, as a code span: `path:line`, with an overlong path clipped before the line number."""
-    path = " ".join(path.split())
-    return code_span(f"{path if len(path) <= MAX_PATH else path[: MAX_PATH - 1] + '…'}:{line}")
+    return code_span(f"{sanitize(' '.join(path.split()), limit=MAX_PATH)}:{line}")
 
 
 _HEADING = "**{rank}{title}** ({kind}{gate})"
