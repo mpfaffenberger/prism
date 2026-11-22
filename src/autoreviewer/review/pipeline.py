@@ -13,18 +13,20 @@ from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from pydantic_ai import Agent, AgentRunResult, Tool
+from pydantic_ai import Agent, Tool
 from pydantic_ai.capabilities import AbstractCapability
-from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
 from pydantic_ai.toolsets import FunctionToolset
 
 from autoreviewer.review.agents import FOCUS, LENS_LIMITS, LENS_RULES, REPORT_TOOL, VERIFIER_LIMITS
+from autoreviewer.review.checkpoints import Ran
 from autoreviewer.review.compaction import compaction_stats
 from autoreviewer.review.diff import ChangedPath, commentable_lines
 from autoreviewer.review.memory import PriorReview
 from autoreviewer.review.progress import Progress
 from autoreviewer.review.render import sanitize
 from autoreviewer.review.schemas import ADVISORY_KINDS, Finding, LensKind, LensReport, Verification
+from autoreviewer.review.sessions import run_role
 from autoreviewer.web.config import AgentKind, verifier_role
 
 if TYPE_CHECKING:
@@ -311,19 +313,24 @@ async def check_candidate[T](
     sessions: RoleSessions | None,
 ) -> T:
     agent = select_checker(checker)
-    role = verifier_role(kind)
-    history = await sessions.history(role, agent, subject=subject) if sessions else None
-    result = await agent.run(
+    verify = (
         prompt + "\nIndependently verify this candidate: you MUST re-read the current HEAD code. "
-        "Earlier tool results are stale and a previous verdict is not evidence.",
-        message_history=history,
-        workspace=current_workspace(history),
-        usage_limits=VERIFIER_LIMITS,
-        capabilities=[watch],
+        "Earlier tool results are stale and a previous verdict is not evidence."
     )
-    if sessions:
-        sessions.record(role, agent, result.all_messages(), subject=subject)
-    return result.output
+    ran = await run_role(
+        sessions,
+        verifier_role(kind),
+        agent,
+        lambda messages, resuming, recorders: agent.run(
+            None if resuming else verify,
+            message_history=messages,
+            workspace=current_workspace(messages),
+            usage_limits=VERIFIER_LIMITS,
+            capabilities=[*recorders, watch],
+        ),
+        subject=subject,
+    )
+    return ran.output
 
 
 class Judge:
@@ -361,6 +368,29 @@ class Judge:
             return self.submit(finding)
 
         return FunctionToolset([Tool(report, name=REPORT_TOOL)])
+
+    def replay(self, history: Sequence[ModelMessage]) -> None:
+        """Rebuild what an interrupted lens run reported: resubmit, in order, each `report_finding` call that was
+        recorded (answered with success, not retried or closed out as interrupted). Verdicts that finished before
+        the restart come back from their checkpoints; only unfinished ones run again. A report that compaction
+        summarized away is recovered later, from the final report, which lists every finding."""
+        answered = {
+            part.tool_call_id
+            for message in history
+            if isinstance(message, ModelRequest)
+            for part in message.parts
+            if isinstance(part, ToolReturnPart) and part.tool_name == REPORT_TOOL and part.outcome == "success"
+        }
+        for message in history:
+            if not isinstance(message, ModelResponse):
+                continue
+            for part in message.parts:
+                if isinstance(part, ToolCallPart) and part.tool_name == REPORT_TOOL and part.tool_call_id in answered:
+                    try:
+                        finding = Finding.model_validate(part.args_as_dict()["finding"])
+                    except (KeyError, ValueError):
+                        continue  # it was answered with a retry, not recorded
+                    self.submit(finding)
 
     def submit(self, finding: Finding) -> str:
         """Start verifying `finding`, unless it's out of scope, a hunch, or not more urgent than what was
@@ -434,15 +464,15 @@ class Judge:
             await self._publish(finding)
 
 
-LensRun = Callable[[list[FunctionToolset[None]]], Awaitable[AgentRunResult[LensReport]]]
-"""Starts a lens run with these extra toolsets."""
+LensRun = Callable[[list[FunctionToolset[None]], Callable[[list[ModelMessage]], None]], Awaitable[Ran[LensReport]]]
+"""Starts a lens run with these extra toolsets, and what to call with its history if it resumes after a restart."""
 
 
-async def _run_judged(judge: Judge, run: LensRun, *, report_as_you_go: bool = True) -> AgentRunResult[LensReport]:
+async def _run_judged(judge: Judge, run: LensRun, *, report_as_you_go: bool = True) -> Ran[LensReport]:
     """Run a lens (with `report_finding` if it reports as it goes), then judge its final report; no verification
     outlives a failure."""
     try:
-        result = await run([judge.toolset()] if report_as_you_go else [])
+        result = await run([judge.toolset()] if report_as_you_go else [], judge.replay)
         await judge.finish(result.output.findings)
     except BaseException:
         judge.cancel()
@@ -482,22 +512,25 @@ async def review_lens(
     )
     report_as_you_go = max_posted >= MAX_FINDINGS
     combined = "\n\n".join(part for part in (instructions, LENS_RULES if report_as_you_go else FOCUS) if part)
-    history = await sessions.history(kind, lens) if sessions else None
     run = await _run_judged(
         judge,
-        lambda toolsets: lens.run(
-            finder_prompt(lens_prompt(pr), history),
-            message_history=history,
-            workspace=current_workspace(history),
-            instructions=combined,
-            toolsets=toolsets,
-            capabilities=[*capabilities, progress.watch(kind)],
-            usage_limits=LENS_LIMITS,
+        lambda toolsets, replay: run_role(
+            sessions,
+            kind,
+            lens,
+            lambda messages, resuming, recorders: lens.run(
+                None if resuming else finder_prompt(lens_prompt(pr), messages),
+                message_history=messages,
+                workspace=current_workspace(messages),
+                instructions=combined,
+                toolsets=toolsets,
+                capabilities=[*recorders, *capabilities, progress.watch(kind)],
+                usage_limits=LENS_LIMITS,
+            ),
+            on_resume=replay,
         ),
         report_as_you_go=report_as_you_go,
     )
-    if sessions:
-        sessions.record(kind, lens, run.all_messages())
     logger.info("%s: %d requests, %d posted", kind, run.usage.requests, len(outcome.posted))
     return outcome
 
@@ -531,21 +564,25 @@ async def review(
     judge = Judge(pr, verifier, progress, outcome, label="verifier", publish=publish, sessions=sessions)
     lens_run = await _run_judged(
         judge,
-        lambda toolsets: lens.run(
-            finder_prompt(prompt, history),
-            instructions=LENS_RULES,
-            toolsets=toolsets,
-            message_history=history,
-            capabilities=[*lens_capabilities, progress.watch("reviewer")],
-            conversation_id=conversation,
-            # The history names the last review's checkout; this review has a new one (the new head).
-            workspace="new" if continuation else current_workspace(history),
-            usage_limits=LENS_LIMITS,
+        lambda toolsets, replay: run_role(
+            sessions,
+            "correctness",
+            lens,
+            lambda messages, resuming, recorders: lens.run(
+                None if resuming else finder_prompt(prompt, messages),
+                instructions=LENS_RULES,
+                toolsets=toolsets,
+                message_history=messages,
+                capabilities=[*recorders, *lens_capabilities, progress.watch("reviewer")],
+                conversation_id=conversation,
+                # The history names the last review's checkout; this review has a new one (the new head).
+                workspace="new" if continuation else current_workspace(messages),
+                usage_limits=LENS_LIMITS,
+            ),
+            history=history,
+            on_resume=replay,
         ),
     )
-
-    if sessions:
-        sessions.record("correctness", lens, lens_run.all_messages())
     report, usage = lens_run.output, lens_run.usage
     outcome.overall_correct, outcome.reviewed = report.overall_correct, report.reviewed
     compacted = compaction_stats(lens_run.all_messages())

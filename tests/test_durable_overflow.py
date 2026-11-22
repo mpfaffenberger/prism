@@ -45,8 +45,9 @@ async def test_overflow_with_local_backlog(tmp_path: Path, monkeypatch: pytest.M
             yield deps
 
     async def review(
-        deps: job.ReviewDeps, pull: PullRequestUpdated, check_id: int, *, remaining_s: float
+        deps: job.ReviewDeps, pull: PullRequestUpdated, check_id: int, *, remaining_s: float, attempt: str | None
     ) -> job.CheckResult:
+        assert attempt and attempt == DBOS.workflow_id  # each attempt checkpoints its turns under its own id
         budgets[pull.number] = remaining_s
         assert check_id == 100 + pull.number
         lane = "primary" if deps is primary else "overflow"

@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart, UserPromptPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.tools import ToolDefinition
 
@@ -57,6 +66,46 @@ async def test_a_lens_past_the_deadline_returns_its_report(workspace: Workspace)
     )
     assert tools_offered == [0] and [f.line for f in run.output.findings] == [5]
     assert deadline.wrapped_up == {"reviewer"}
+
+
+@pytest.mark.parametrize(
+    ("given_by", "warned_again"),
+    [pytest.param("this attempt", False), pytest.param("an earlier attempt", True)],
+)
+async def test_a_resumed_run_is_not_given_a_notice_twice(
+    workspace: Workspace, given_by: str, warned_again: bool
+) -> None:
+    """Resumed after a restart, the run's history already holds the notices this attempt gave it. A notice from an
+    earlier attempt, in a continued conversation, doesn't count: this attempt still warns."""
+    deadline = Deadline(soft_s=540, started=time.monotonic() - 300)  # four minutes left: the five-minute stage
+    given = datetime.now(UTC) if given_by == "this attempt" else deadline.began - timedelta(hours=1)
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart("review")]),
+        ModelResponse(parts=[ToolCallPart("changed_files", {}, "first")]),
+        ModelRequest(
+            parts=[ToolReturnPart("changed_files", "stats.py", "first"), UserPromptPart(FIVE_MINUTES, timestamp=given)]
+        ),
+        ModelResponse(parts=[ToolCallPart("changed_files", {}, "second")]),
+        ModelRequest(parts=[ToolReturnPart("changed_files", "stats.py", "second")]),
+    ]
+    notices: list[int] = []
+
+    def lens(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        notices.append(
+            sum(
+                isinstance(p, UserPromptPart) and p.content == FIVE_MINUTES
+                for m in messages
+                if isinstance(m, ModelRequest)
+                for p in m.parts
+            )
+        )
+        report = {"findings": [], "overall_correct": True, "reviewed": ["stats.py"]}
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, report)])
+
+    await correctness_agent(FunctionModel(lens), workspace).run(
+        message_history=history, capabilities=[deadline.watch("reviewer")]
+    )
+    assert notices == [2 if warned_again else 1]
 
 
 @pytest.mark.parametrize(("budget", "focus", "stop"), [(540, 300, 60), (54, 30, 6)])
@@ -319,3 +368,16 @@ async def test_timeout_cleanup_only_for_closed_pr(repo: GitRepo, tmp_path: Path,
     result = await review_and_post(deps, event, check, remaining_s=0)
     await job.finish_check(deps, event, check, result)
     assert any((tmp_path / "history").iterdir()) == (state == "open")
+
+
+def test_multimodal_prompts_are_never_taken_for_notices() -> None:
+    """A user prompt with a list of contents (text plus an image, say) can't be a notice, and mustn't break the
+    search for one."""
+    from autoreviewer.review.deadline import _last_notice
+
+    started = datetime.now(UTC) - timedelta(minutes=1)
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(FIVE_MINUTES)]),
+        ModelRequest(parts=[UserPromptPart(["see the screenshot", "and the log"])]),
+    ]
+    assert _last_notice(history, since=started) == FIVE_MINUTES

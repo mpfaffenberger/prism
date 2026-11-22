@@ -28,6 +28,7 @@ from autoreviewer.github import (
     Repo,
     ReviewEvent,
 )
+from autoreviewer.review.checkpoints import TurnCheckpoints
 from autoreviewer.review.deadline import DEFAULT_SOFT_S, MAX_REVIEW_S, Deadline
 from autoreviewer.review.diff import MAX_CHANGED_LINES, added_lines, select
 from autoreviewer.review.lint import LINT_KINDS, MAX_LINT_FINDINGS, LintError, lint_findings
@@ -223,13 +224,35 @@ async def finish_check(deps: ReviewDeps, pull: PullRequestUpdated, check_id: int
 
 
 async def review_and_post(
-    deps: ReviewDeps, pull: PullRequestUpdated, check_id: int | None = None, *, remaining_s: float | None = None
+    deps: ReviewDeps,
+    pull: PullRequestUpdated,
+    check_id: int | None = None,
+    *,
+    remaining_s: float | None = None,
+    attempt: str | None = None,
 ) -> CheckResult:
     """Review within one wall-clock budget, including GitHub reads, posting and progress updates.
 
-    On recovery, `remaining_s` is the time left on the durable hard deadline; neither clock restarts.
-    External cancellation propagates rather than becoming a verdict.
+    On recovery, `remaining_s` is the time left on the durable hard deadline; neither clock restarts. When review
+    memory is configured and `attempt` gives the DBOS workflow ID, each agent run checkpoints its settled turns, so
+    a recovery resumes them instead of repeating them. Without memory, nothing is checkpointed and a recovery runs
+    every turn again. External cancellation propagates rather than becoming a verdict, and keeps the checkpoints
+    for that recovery.
     """
+    result = await _review_within_budget(deps, pull, check_id, remaining_s=remaining_s, attempt=attempt)
+    if attempt is not None and deps.memory is not None:
+        TurnCheckpoints.discard(deps.memory.directory(conversation_id(repo_of(pull), pull.number)), attempt)
+    return result
+
+
+async def _review_within_budget(
+    deps: ReviewDeps,
+    pull: PullRequestUpdated,
+    check_id: int | None,
+    *,
+    remaining_s: float | None,
+    attempt: str | None,
+) -> CheckResult:
     started = asyncio.get_running_loop().time()
     hard_s = min(deps.hard_deadline_s, MAX_REVIEW_S)
     budget = hard_s if remaining_s is None else min(hard_s, remaining_s)
@@ -242,7 +265,7 @@ async def review_and_post(
         if budget <= 0:
             raise TimeoutError
         async with asyncio.timeout_at(started + budget), _publishing(deps, repo, check_id, progress):
-            reviewed = await _review(deps, repo, pull, progress, deadline, check_id)
+            reviewed = await _review(deps, repo, pull, progress, deadline, check_id, attempt)
             if isinstance(reviewed, CheckResult):
                 result = reviewed
             else:
@@ -334,6 +357,7 @@ async def review_change(
     lenses: Sequence[Lens] = (),
     publish: Publish | None = None,
     deadline: Deadline | None = None,
+    attempt: str | None = None,
 ) -> Reviewed | CheckResult:
     """Review one PR head: check it out, find what changed, run lens and verifier.
 
@@ -360,7 +384,13 @@ async def review_change(
 
     sessions = (
         RoleSessions(
-            memory.directory(conversation), head_sha, base, compatible, f"{repo.installation_id}:{session_namespace}"
+            memory.directory(conversation),
+            head_sha,
+            base,
+            compatible,
+            f"{repo.installation_id}:{session_namespace}",
+            # A restarted attempt resumes each run from its settled turns (overflow too: its namespace is in the key).
+            turns=TurnCheckpoints(memory.directory(conversation), attempt) if attempt else None,
         )
         if memory
         else None
@@ -543,7 +573,13 @@ def _prior_review(run_id: str, head_sha: str, base: str, version: str, outcome: 
 
 
 async def _review(
-    deps: ReviewDeps, repo: Repo, pull: PullRequestUpdated, progress: Progress, deadline: Deadline, check_id: int | None
+    deps: ReviewDeps,
+    repo: Repo,
+    pull: PullRequestUpdated,
+    progress: Progress,
+    deadline: Deadline,
+    check_id: int | None,
+    attempt: str | None,
 ) -> CheckResult | Outcome:
     if check_id is not None and (published := await _published_result(deps, pull, check_id)) is not None:
         return published  # crashed after posting: never run models or post findings for this attempt again
@@ -576,6 +612,7 @@ async def _review(
                 lenses=deps.lenses,
                 publish=publisher,
                 deadline=deadline,
+                attempt=attempt,
             ),
         )
 

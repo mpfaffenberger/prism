@@ -249,6 +249,15 @@ Crash recovery uses the original check and remaining time. A fresh explicit requ
 starts a new check and budget, even if the commit already has a verdict. Publication recognizes the
 check ID in the bot's review footer so recovery does not repeat that attempt's verdict.
 
+Recovery also repeats no model work that finished (`review/checkpoints.py`, #60). Every agent run in an
+attempt (each lens, checker, and the simplifier) checkpoints its settled turns, keyed by the DBOS workflow
+id, role, candidate and model identity. After a restart a finished run returns its stored result and an
+interrupted one continues from its last settled turn; a lens's reported findings are resubmitted so their
+finished verdicts come back from their own checkpoints. Only the request in flight is sent again (with any
+compaction that prepared it), so billing is not exactly-once. A run never resumes another model's or the
+overflow namespace's checkpoint. The checkpoints are dropped once the attempt has its verdict, and with the
+PR's memory when it closes.
+
 ### Deterministic checks (no model)
 
 Rules a tool can decide exactly are a linter's job, not a lens's. `review/lint.py` runs ruff on the
