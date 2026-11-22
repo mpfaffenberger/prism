@@ -118,10 +118,7 @@ def checking_cutoff(hard_s: float) -> float:
 
 async def before_cutoff[T](deadline: Deadline | None, work: Awaitable[T]) -> T | None:
     """`work`'s result, or None if the checking cutoff arrives first (`work` is then cancelled)."""
-    remaining = deadline.checking_remaining if deadline else None
-    if remaining is None:
-        return await work
-    cutoff = asyncio.timeout(remaining)
+    cutoff = asyncio.timeout(deadline.checking_remaining if deadline else None)  # None never expires
     try:
         async with cutoff:
             return await work

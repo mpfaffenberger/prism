@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from autoreviewer.review.deadline import Deadline, checking_cutoff
+from autoreviewer.review.job import CheckResult
+from evals import run as runner
+from evals.cases import Case
 from evals.run import arguments, plan_from_env
 from tests.reference_profile import DEEPSEEK, QWEN
 from tests.test_reasoning import effort
@@ -15,6 +21,24 @@ def test_the_time_limits_default_to_the_bots_env_included() -> None:
     env = {"PRISM_SOFT_DEADLINE_MINUTES": "3", "PRISM_HARD_DEADLINE_MINUTES": "7"}
     args = arguments([], env)
     assert (args.soft_minutes, args.hard_minutes) == (3, 7)
+
+
+@pytest.mark.anyio
+async def test_a_case_runs_under_the_bots_checking_cutoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without it a case waits for every check, and one that reaches the hard stop scores as nothing found."""
+    seen: list[Deadline] = []
+
+    async def review_change(*, deadline: Deadline, **_: object) -> CheckResult:
+        seen.append(deadline)
+        return CheckResult("Nothing to review", "", "success")
+
+    repo = runner.GitRepo(tmp_path, "b" * 40, "a" * 40)
+    monkeypatch.setattr(runner, "build_repo", lambda case, parent: (repo, [1]))
+    monkeypatch.setattr(runner, "review_change", review_change)
+    case = Case("demo", "stats.py", "old", "new", "A change")
+    await runner.run_case(case, lambda workspace: NotImplemented, [], tmp_path, soft_s=300, hard_s=400)
+    [deadline] = seen
+    assert (deadline.soft_s, deadline.checking_s) == (300, checking_cutoff(400))
 
 
 @pytest.mark.parametrize(
