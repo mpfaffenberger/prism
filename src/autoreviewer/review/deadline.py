@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Container
 from dataclasses import dataclass, field
 
 from pydantic_ai import RunContext
@@ -131,21 +131,37 @@ async def before_cutoff[T](deadline: Deadline | None, start: Callable[[], Awaita
         return None
 
 
+class Finishing:
+    """The tasks past their decision, with only its result left to write down (posting a confirmed finding,
+    say). `until_cutoff` lets those complete: a post cancelled after it reached GitHub would go unrecorded and
+    be posted again with the verdict."""
+
+    def __init__(self) -> None:
+        self._tasks: set[asyncio.Task[object]] = set()
+
+    def mark(self) -> None:
+        """The calling task has decided. Call this before its first write, with no await in between."""
+        if (task := asyncio.current_task()) is not None:
+            self._tasks.add(task)
+
+    def __contains__(self, task: object) -> bool:
+        return task in self._tasks
+
+
 async def until_cutoff[T](
     deadline: Deadline | None,
     tasks: Collection[asyncio.Task[T]],
     *,
-    finishing: Callable[[asyncio.Task[T]], bool] = lambda task: False,
+    finishing: Container[object] = (),
 ) -> list[asyncio.Task[T]]:
     """Wait for `tasks` until the checking cutoff, then cancel and return the ones still running. A task
     that finished with an error raises here, as `asyncio.gather` would.
 
-    A task `finishing` picks is past its decision and only writing it down (posting a confirmed finding, say):
-    it is left to complete, not cancelled and not returned, so the write isn't cut off halfway."""
+    A task in `finishing` (see `Finishing`) is left to complete, not cancelled and not returned."""
     if not tasks:
         return []
     done, pending = await asyncio.wait(tasks, timeout=deadline.checking_remaining if deadline else None)
-    cut = [task for task in tasks if task in pending and not finishing(task)]
+    cut = [task for task in tasks if task in pending and task not in finishing]
     for task in cut:
         task.cancel()
     await asyncio.gather(*pending, return_exceptions=True)  # cancellations land, and what was finishing completes

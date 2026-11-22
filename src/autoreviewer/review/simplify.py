@@ -21,7 +21,7 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability
 
 from autoreviewer.review.agents import LENS_LIMITS
-from autoreviewer.review.deadline import Deadline, before_cutoff, until_cutoff
+from autoreviewer.review.deadline import Deadline, Finishing, before_cutoff, until_cutoff
 from autoreviewer.review.diff import added_lines
 from autoreviewer.review.pipeline import (
     CheckAgent,
@@ -170,9 +170,7 @@ async def simplify(
             progress.note(f"{'kept' if verdict.confirmed else 'dropped'} simplification: {suggestion.title}")
             return verdict.confirmed
 
-    posting: set[asyncio.Task[None]] = set()
-    """Checks with their verdict in and their suggestion on the way to GitHub: the cutoff lets that post finish,
-    or a post cut off after it reached GitHub would go unrecorded and be posted again with the verdict."""
+    posting = Finishing()  # checks with their verdict in and their suggestion on the way to GitHub
 
     async def check(suggestion: Suggestion) -> None:
         """Check one suggestion and, if it holds, post it at once."""
@@ -182,13 +180,12 @@ async def simplify(
         finding = _finding(suggestion)
         result.posted.append(finding)
         if publish is not None:
-            if (task := asyncio.current_task()) is not None:
-                posting.add(task)
+            posting.mark()
             await publish(finding)
 
     checks = [asyncio.create_task(check(suggestion)) for suggestion in accepted]
     try:
-        if cut := await until_cutoff(deadline, checks, finishing=posting.__contains__):
+        if cut := await until_cutoff(deadline, checks, finishing=posting):
             progress.note(f"{len(cut)} simplification(s) not checked in time")
     except BaseException:
         for task in checks:

@@ -146,7 +146,7 @@ def test_the_report_tells_unchecked_candidates_from_verifier_failures() -> None:
     late = Finding.model_validate(finding(5, title="Not reached in time"))
     broken = Finding.model_validate(finding(4, title="Verifier crashed on this"))
     outcome = Outcome(unverified=[(late, OUT_OF_TIME), (broken, "verification failed: RuntimeError")], cut_short=True)
-    text = ondemand.Report(REF, "a" * 40, "title", outcome).render()
+    text = _report(outcome).render()  # type: ignore[attr-defined]
     unchecked, failed = text.split("could not be verified")
     assert "**1 candidate(s) were not checked before the time limit**" in unchecked
     assert "- `stats.py:5`\n" in unchecked and "Verifier crashed" not in unchecked

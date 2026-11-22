@@ -20,7 +20,7 @@ from pydantic_ai.toolsets import FunctionToolset
 
 from autoreviewer.review.agents import FOCUS, LENS_LIMITS, LENS_RULES, REPORT_TOOL, VERIFIER_LIMITS
 from autoreviewer.review.compaction import compaction_stats
-from autoreviewer.review.deadline import Deadline, before_cutoff, until_cutoff
+from autoreviewer.review.deadline import Deadline, Finishing, before_cutoff, until_cutoff
 from autoreviewer.review.diff import ChangedPath, commentable_lines
 from autoreviewer.review.memory import PriorReview
 from autoreviewer.review.progress import Progress
@@ -373,7 +373,7 @@ class Judge:
         self._reviewable = {change.path for change in pr.reviewable}
         self._slots = asyncio.Semaphore(VERIFY_CONCURRENCY)
         self._tasks: dict[asyncio.Task[None], Finding] = {}
-        self._judged: set[asyncio.Task[None]] = set()
+        self._judged = Finishing()
         """Verifications with their verdict in, which only have their finding left to post. Per task, not per
         line: a replaced report's task shares its line with the replacement and must not pass for it."""
         self._latest: dict[tuple[str, int], Finding] = {}
@@ -427,7 +427,7 @@ class Judge:
             self._progress.set_phase(f"Verifying {len(pending)} candidate finding(s)")
         # A candidate with its verdict in is only being posted: that write completes, so the comment and the
         # record of it can't come apart (a cancelled post that still reached GitHub would be posted twice).
-        cut = await until_cutoff(self._deadline, self._tasks, finishing=self._judged.__contains__)
+        cut = await until_cutoff(self._deadline, self._tasks, finishing=self._judged)
         # A report a more urgent one replaced isn't a candidate any more: only its replacement counts.
         unjudged = [f for f in map(self._tasks.__getitem__, cut) if self._latest.get((f.path, f.line)) is f]
         if not unjudged:
@@ -461,8 +461,7 @@ class Judge:
         self._progress.note(f"{'confirmed' if verdict.confirmed else 'rejected'}: {finding.title}")
         if self._latest.get((finding.path, finding.line)) is not reported:
             return  # a more urgent report for this line superseded it while it was being verified
-        if (task := asyncio.current_task()) is not None:
-            self._judged.add(task)
+        self._judged.mark()
         if not verdict.confirmed:
             self._outcome.rejected.append((finding, verdict.reason))
             return
@@ -491,7 +490,7 @@ async def _run_judged(
     judged, and `label` joins the lenses that were cut off, since it never said what it covered."""
     try:
         result = await before_cutoff(deadline, lambda: run([judge.toolset()] if report_as_you_go else []))
-        if result is None and deadline is not None:
+        if result is None and deadline is not None:  # None means its cutoff fired; the second test is for Pyright
             deadline.wrapped_up.add(label)
         await judge.finish(result.output.findings if result else [])
     except BaseException:
