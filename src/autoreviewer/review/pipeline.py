@@ -152,6 +152,11 @@ class Outcome:
         return [finding for finding, why in self.unverified if why == OUT_OF_TIME]
 
     @property
+    def verifier_failed(self) -> list[tuple[Finding, str]]:
+        """The rest of `unverified`: candidates whose verifier raised, each with why."""
+        return [(finding, why) for finding, why in self.unverified if why != OUT_OF_TIME]
+
+    @property
     def reported(self) -> list[Finding]:
         """Everything the lenses reported, whatever became of it: posted, unverified, rejected, or a hunch."""
         return [

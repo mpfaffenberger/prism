@@ -488,7 +488,8 @@ async def review_change(
     outcome.cut_short = timed_out or bool(outcome.failed_blocking) or bool(outcome.cut - ADVISORY_KINDS)
     if deadline is not None:
         outcome.uncover("correctness" if lens == "reviewer" else lens for lens in deadline.wrapped_up)
-    outcome.uncover(outcome.cut)  # an unjudged candidate may be a finding that still stands: nothing is "fixed"
+    # A candidate dropped unjudged leaves no trace in `reported`, so its kind can't call anything "fixed".
+    outcome.uncover(outcome.cut)
     # A capped lens verifies only its best candidates and drops the rest: at its cap, it may have dropped one.
     caps = {"correctness": MAX_FINDINGS, **{spec.kind: spec.max_posted for spec in lenses}}
     outcome.uncover(kind for kind, cap in caps.items() if sum(f.kind == kind for f in outcome.reported) >= cap)

@@ -34,11 +34,16 @@ def sanitize(text: str, *, limit: int = MAX_TEXT) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _fence(text: str, *, minimum: int = 1) -> str:
+    """Backticks that nothing in `text` can close: one more than its longest run of them, at least `minimum`."""
+    return "`" * max(minimum, max(map(len, re.findall("`+", text)), default=0) + 1)
+
+
 def code_span(text: str) -> str:
     """`text` as an inline code span that nothing inside it can close. A PR's author chooses its file names, so
     a path may hold backticks or line breaks meant to break out and plant links or mentions in the bot's review."""
     text = sanitize(" ".join(text.split()), limit=200)
-    fence = "`" * (max(map(len, re.findall("`+", text)), default=0) + 1)
+    fence = _fence(text)
     pad = " " if text.startswith("`") or text.endswith("`") else ""
     return f"{fence}{pad}{text}{pad}{fence}"
 
@@ -71,7 +76,7 @@ def comment_body(finding: Finding, *, blocking: bool = True) -> str:
     # Not sanitized: it's code the author applies with one click (a zero-width space after an "@" would
     # break a decorator), GitHub doesn't ping mentions inside code blocks, and suggestions with secrets
     # never get this far. The fence outgrows any backtick run inside.
-    fence = "`" * max([3, *(len(run) + 1 for run in re.findall(r"`+", finding.replacement))])
+    fence = _fence(finding.replacement, minimum=3)
     return f"{body}\n\n{fence}suggestion\n{finding.replacement}\n{fence}"
 
 
