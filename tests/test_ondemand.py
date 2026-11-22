@@ -138,6 +138,22 @@ def _report(result: object) -> object:
     return Report(REF, "a" * 40, "title", result)  # type: ignore[arg-type]
 
 
+def test_the_report_tells_unchecked_candidates_from_verifier_failures() -> None:
+    """From the bot's review of #65: a candidate the time limit left unchecked is not a verifier failure."""
+    from autoreviewer.review.pipeline import OUT_OF_TIME, Outcome
+    from autoreviewer.review.schemas import Finding
+
+    late = Finding.model_validate(finding(5, title="Not reached in time"))
+    broken = Finding.model_validate(finding(4, title="Verifier crashed on this"))
+    outcome = Outcome(unverified=[(late, OUT_OF_TIME), (broken, "verification failed: RuntimeError")], cut_short=True)
+    text = _report(outcome).render()  # type: ignore[attr-defined]
+    unchecked, failed = text.split("could not be verified")
+    assert "**1 candidate(s) were not checked before the time limit**" in unchecked
+    assert "- `stats.py:5`\n" in unchecked and "Verifier crashed" not in unchecked
+    assert "`stats.py:4` Verifier crashed on this: verification failed: RuntimeError" in failed
+    assert "Not reached in time" not in text and "PARTIALLY REVIEWED" in text  # where, never the unverified claim
+
+
 @pytest.mark.usefixtures("cli")
 @pytest.mark.parametrize(("blocking", "code"), [(True, 1), (False, 0)])
 def test_verdicts_map_to_exit_codes(monkeypatch: pytest.MonkeyPatch, blocking: bool, code: int) -> None:
@@ -152,6 +168,25 @@ def test_verdicts_map_to_exit_codes(monkeypatch: pytest.MonkeyPatch, blocking: b
 
     monkeypatch.setattr(ondemand, "review_pr", fake_review)
     assert ondemand.run(["o/r#1"]) == code
+
+
+@pytest.mark.usefixtures("cli")
+def test_the_cli_reviews_under_the_bots_time_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """From the bot's review of #65: without the checking cutoff an on-demand review waits for every check and
+    can hit the hard stop with no verdict."""
+    from autoreviewer.review.deadline import DEFAULT_SOFT_S, MAX_REVIEW_S, Deadline, checking_cutoff
+    from autoreviewer.review.pipeline import Outcome
+
+    seen: list[Deadline] = []
+
+    async def fake_review(*_: object, deadline: Deadline, **__: object) -> object:
+        seen.append(deadline)
+        return _report(Outcome())
+
+    monkeypatch.setattr(ondemand, "review_pr", fake_review)
+    assert ondemand.run(["o/r#1"]) == 0
+    [deadline] = seen
+    assert (deadline.soft_s, deadline.checking_s) == (DEFAULT_SOFT_S, checking_cutoff(MAX_REVIEW_S))
 
 
 @pytest.mark.usefixtures("cli")

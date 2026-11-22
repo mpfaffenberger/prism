@@ -34,6 +34,32 @@ def sanitize(text: str, *, limit: int = MAX_TEXT) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def _fence(text: str, *, minimum: int = 1) -> str:
+    """Backticks that nothing in `text` can close: one more than its longest run of them, at least `minimum`."""
+    return "`" * max(minimum, max(map(len, re.findall("`+", text)), default=0) + 1)
+
+
+def code_span(text: str, *, limit: int = MAX_TEXT, suffix: str = "") -> str:
+    """`text` as an inline code span that nothing inside it can close. A PR's author chooses its file names, so
+    a path may hold backticks or line breaks meant to break out and plant links or mentions in the bot's review.
+
+    Line breaks and tabs become a space; spaces stay as they are, so the name shown is the file's name.
+    `text` is clipped to `limit`; `suffix` is our own text, added after the clip so it is never cut."""
+    text = sanitize(re.sub(r"[^\S ]+", " ", text), limit=limit) + suffix
+    fence = _fence(text)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+MAX_PATH = 200
+"""Characters of a file's path shown in a location; the line number after it is never cut."""
+
+
+def location(path: str, line: int) -> str:
+    """Where a finding is, as a code span: `path:line`, with an overlong path clipped before the line number."""
+    return code_span(path, limit=MAX_PATH, suffix=f":{line}")
+
+
 _HEADING = "**{rank}{title}** ({kind}{gate})"
 """A finding comment's first line: comment_body writes it, posted_title reads it back."""
 _POSTED_TITLE = re.compile(
@@ -62,7 +88,7 @@ def comment_body(finding: Finding, *, blocking: bool = True) -> str:
     # Not sanitized: it's code the author applies with one click (a zero-width space after an "@" would
     # break a decorator), GitHub doesn't ping mentions inside code blocks, and suggestions with secrets
     # never get this far. The fence outgrows any backtick run inside.
-    fence = "`" * max([3, *(len(run) + 1 for run in re.findall(r"`+", finding.replacement))])
+    fence = _fence(finding.replacement, minimum=3)
     return f"{body}\n\n{fence}suggestion\n{finding.replacement}\n{fence}"
 
 
@@ -81,13 +107,19 @@ def review_body(outcome: Outcome, *, footer: str) -> str:
         if outcome.standing
         else ""
     )
+    # Where the unchecked candidates are, without their text: an unverified claim is never posted.
+    unchecked = (
+        f"Not checked before the time limit: {', '.join(location(f.path, f.line) for f in outcome.unchecked)}.\n\n"
+        if outcome.unchecked
+        else ""
+    )
     if not posted:
         found = "No new issues found" if standing else "No issues found"
         where = " in the part reviewed" if cut_short else ""
-        return f"{cut_short}{standing}{found}{where}.\n\n{footer}"
+        return f"{cut_short}{unchecked}{standing}{found}{where}.\n\n{footer}"
     blocking = [f for f in posted if outcome.is_blocking(f)]
     advisory = [f for f in posted if not outcome.is_blocking(f)]
-    lines = [note.rstrip() for note in (cut_short, standing) if note]
+    lines = [note.rstrip() for note in (cut_short, unchecked, standing) if note]
     if blocking:
         lines.append(f"Found {_count(blocking)} to fix before merging.")
     simplify = [f for f in advisory if f.kind == "simplify"]
@@ -101,7 +133,7 @@ def review_body(outcome: Outcome, *, footer: str) -> str:
     if outcome.general:
         lines.append("\nOutside the changed lines:")
         lines.extend(
-            f"- `{f.path}:{f.line}`: {comment_body(f, blocking=outcome.is_blocking(f))}" for f in outcome.general
+            f"- {location(f.path, f.line)}: {comment_body(f, blocking=outcome.is_blocking(f))}" for f in outcome.general
         )
     lines.append(f"\n{footer}")
     return "\n".join(lines)

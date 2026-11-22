@@ -29,6 +29,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from autoreviewer.github import Conclusion, Repo, ReviewComment, ReviewEvent
 from autoreviewer.review import durable
 from autoreviewer.review.agents import REPORT_TOOL, correctness_agent, verifier_agent
+from autoreviewer.review.deadline import MAX_REVIEW_S
 from autoreviewer.review.memory import ReviewMemory
 from autoreviewer.web.routing import PullRequestUpdated
 from tests.review_fakes import FakeGitHub, GitRepo, finding, job_deps, make_repo, verifier_model
@@ -149,8 +150,8 @@ async def main() -> None:
         memory=ReviewMemory(DIR / "memory"),
     )
     if MODE == "recover-after-deadline":
-        # Advance only the review clock: simulate ten minutes of downtime without sleeping.
-        durable.time = lambda: time() + 600
+        # Advance only the review clock: simulate downtime as long as the whole budget, without sleeping.
+        durable.time = lambda: time() + MAX_REVIEW_S
     durable.configure(DIR / "dbos.sqlite")
     await durable.launch(deps, concurrency=2)
     try:

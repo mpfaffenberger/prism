@@ -21,6 +21,7 @@ from pydantic_ai import Agent
 from pydantic_ai.capabilities import AbstractCapability
 
 from autoreviewer.review.agents import LENS_LIMITS
+from autoreviewer.review.deadline import Deadline, Finishing, before_cutoff, until_cutoff
 from autoreviewer.review.diff import added_lines
 from autoreviewer.review.pipeline import (
     CheckAgent,
@@ -75,13 +76,22 @@ async def suggest(
     paths: Collection[str] | None = None,
     publish: Publish | None = None,
     capabilities: Sequence[AbstractCapability[None]] = (),
+    deadline: Deadline | None = None,
 ) -> list[Finding]:
     """Checked suggestions for the PR's added lines, limited to `paths` if given (e.g. what changed since
     the last review, so each push doesn't repeat the same suggestions). Never raises: suggestions are
     optional, so any failure here costs only them, never the review."""
     try:
         run = await simplify(
-            pr, simplifier, root, progress, paths=paths, publish=publish, capabilities=capabilities, sessions=sessions
+            pr,
+            simplifier,
+            root,
+            progress,
+            paths=paths,
+            publish=publish,
+            capabilities=capabilities,
+            sessions=sessions,
+            deadline=deadline,
         )
         return run.posted
     except Exception:
@@ -99,25 +109,33 @@ async def simplify(
     paths: Collection[str] | None = None,
     publish: Publish | None = None,
     capabilities: Sequence[AbstractCapability[None]] = (),
+    deadline: Deadline | None = None,
 ) -> SimplifyRun:
-    """One unguarded pass with its full accounting (the eval reads it; the bot uses `suggest`)."""
+    """One unguarded pass with its full accounting (the eval reads it; the bot uses `suggest`). At the
+    `deadline`'s checking cutoff it stops: suggestions are optional, so the unchecked ones are just not posted."""
     result = SimplifyRun()
     scoped = [change for change in pr.reviewable if paths is None or change.path in paths]
     if not scoped:
         return result
     propose = simplifier.propose
-    run = await run_role(
-        sessions,
-        "simplify",
-        propose,
-        lambda messages, resuming, recorders: propose.run(
-            None if resuming else finder_prompt(lens_prompt(replace(pr, reviewable=scoped)), messages),
-            message_history=messages,
-            workspace=current_workspace(messages),
-            usage_limits=LENS_LIMITS,
-            capabilities=[*recorders, *capabilities, progress.watch("simplifier")],
+    run = await before_cutoff(
+        deadline,
+        lambda: run_role(
+            sessions,
+            "simplify",
+            propose,
+            lambda messages, resuming, recorders: propose.run(
+                None if resuming else finder_prompt(lens_prompt(replace(pr, reviewable=scoped)), messages),
+                message_history=messages,
+                workspace=current_workspace(messages),
+                usage_limits=LENS_LIMITS,
+                capabilities=[*recorders, *capabilities, progress.watch("simplifier")],
+            ),
         ),
     )
+    if run is None:
+        progress.note("simplifications not proposed in time")
+        return result
 
     allowed = {change.path for change in scoped}
     accepted: list[Suggestion] = []
@@ -155,6 +173,8 @@ async def simplify(
             progress.note(f"{'kept' if verdict.confirmed else 'dropped'} simplification: {suggestion.title}")
             return verdict.confirmed
 
+    posting = Finishing()  # checks with their verdict in and their suggestion on the way to GitHub
+
     async def check(suggestion: Suggestion) -> None:
         """Check one suggestion and, if it holds, post it at once."""
         if not await confirmed(suggestion):
@@ -163,9 +183,17 @@ async def simplify(
         finding = _finding(suggestion)
         result.posted.append(finding)
         if publish is not None:
+            posting.mark()
             await publish(finding)
 
-    await asyncio.gather(*(check(suggestion) for suggestion in accepted))
+    checks = [asyncio.create_task(check(suggestion)) for suggestion in accepted]
+    try:
+        if cut := await until_cutoff(deadline, checks, finishing=posting):
+            progress.note(f"{len(cut)} simplification(s) not checked in time")
+    except BaseException:
+        for task in checks:
+            task.cancel()
+        raise
     return result
 
 

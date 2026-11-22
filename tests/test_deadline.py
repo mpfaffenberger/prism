@@ -1,4 +1,5 @@
-"""Time limits: a lens past the soft deadline wraps up with a report; a cut-short review never approves."""
+"""Time limits: a lens past the soft deadline wraps up with a report, checking stops at its cutoff so a verdict
+still goes out, and a cut-short review never approves."""
 
 from __future__ import annotations
 
@@ -21,10 +22,23 @@ from pydantic_ai.messages import (
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.tools import ToolDefinition
 
-from autoreviewer.github import PullRequestState
+from autoreviewer.github import PullRequestState, Repo, ReviewComment
 from autoreviewer.review import job
-from autoreviewer.review.agents import REPORT_TOOL, correctness_agent, verifier_agent
-from autoreviewer.review.deadline import FIVE_MINUTES, ONE_MINUTE, WRAP_UP, Deadline
+from autoreviewer.review.agents import REPORT_TOOL, correctness_agent, lens_pair, verifier_agent
+from autoreviewer.review.deadline import (
+    DEFAULT_SOFT_S,
+    FIVE_MINUTES,
+    FOCUS_S,
+    MAX_REVIEW_S,
+    ONE_MINUTE,
+    POSTING_RESERVE_S,
+    REPORT_ONLY_S,
+    WRAP_UP,
+    Deadline,
+    before_cutoff,
+    checking_cutoff,
+    until_cutoff,
+)
 from autoreviewer.review.job import Lens, Reviewed, repo_of, review_and_post, review_change
 from autoreviewer.review.memory import ReviewMemory, conversation_id
 from autoreviewer.review.workspace import Workspace
@@ -37,6 +51,8 @@ from tests.review_fakes import (
     finding,
     job_deps,
     lens_agents,
+    lens_model,
+    never_answers,
     verifier_model,
 )
 
@@ -77,7 +93,8 @@ async def test_a_resumed_run_is_not_given_a_notice_twice(
 ) -> None:
     """Resumed after a restart, the run's history already holds the notices this attempt gave it. A notice from an
     earlier attempt, in a continued conversation, doesn't count: this attempt still warns."""
-    deadline = Deadline(soft_s=540, started=time.monotonic() - 300)  # four minutes left: the five-minute stage
+    # Two and a half minutes left of the default budget: the five-minute stage.
+    deadline = Deadline(soft_s=DEFAULT_SOFT_S, started=time.monotonic() - (DEFAULT_SOFT_S - FOCUS_S / 2))
     given = datetime.now(UTC) if given_by == "this attempt" else deadline.began - timedelta(hours=1)
     history: list[ModelMessage] = [
         ModelRequest(parts=[UserPromptPart("review")]),
@@ -108,9 +125,13 @@ async def test_a_resumed_run_is_not_given_a_notice_twice(
     assert notices == [2 if warned_again else 1]
 
 
-@pytest.mark.parametrize(("budget", "focus", "stop"), [(540, 300, 60), (54, 30, 6)])
+@pytest.mark.parametrize(
+    ("budget", "focus", "stop"),
+    [(DEFAULT_SOFT_S, FOCUS_S, REPORT_ONLY_S), (DEFAULT_SOFT_S / 10, FOCUS_S / 10, REPORT_ONLY_S / 10)],
+    ids=["default-budget", "a-tenth-of-it"],
+)
 async def test_countdown_is_once_per_stage_and_final_minute_is_report_only(
-    workspace: Workspace, budget: int, focus: int, stop: int
+    workspace: Workspace, budget: float, focus: float, stop: float
 ) -> None:
     deadline = Deadline(soft_s=budget)
     notices: list[list[str]] = []
@@ -144,12 +165,12 @@ async def test_countdown_is_once_per_stage_and_final_minute_is_report_only(
 
 
 async def test_tool_removal_alone_marks_the_lens_forced_to_report() -> None:
-    deadline = Deadline(soft_s=540)
+    deadline = Deadline(soft_s=DEFAULT_SOFT_S)
     capability = deadline.watch("reviewer")
     tools = [ToolDefinition(name="explore")]
     assert await capability.prepare_tools(Mock(), tools) == tools
     assert not deadline.wrapped_up
-    deadline.started -= 481
+    deadline.started -= DEFAULT_SOFT_S - REPORT_ONLY_S + 1
     assert await capability.prepare_tools(Mock(), tools) == []
     assert deadline.wrapped_up == {"reviewer"}
 
@@ -172,7 +193,19 @@ def pull(repo: GitRepo) -> PullRequestUpdated:
     return PullRequestUpdated(installation_id=1, owner="mpfaffenberger", repo="demo", number=7, head_sha=repo.head)
 
 
-@pytest.mark.parametrize("remaining, warning", [(500, None), (320, FIVE_MINUTES), (100, ONE_MINUTE), (30, WRAP_UP)])
+CHECKING_S = MAX_REVIEW_S - DEFAULT_SOFT_S
+"""What the default budget keeps after the lenses wrap up: a recovered job with this much left is at soft expiry."""
+
+
+@pytest.mark.parametrize(
+    "remaining, warning",
+    [
+        (CHECKING_S + FOCUS_S + 100, None),
+        (CHECKING_S + FOCUS_S - 100, FIVE_MINUTES),
+        (CHECKING_S + REPORT_ONLY_S - 20, ONE_MINUTE),
+        (CHECKING_S - 50, WRAP_UP),
+    ],
+)
 async def test_recovered_job_counts_elapsed_time_toward_soft_warnings(
     repo: GitRepo, tmp_path: Path, remaining: float, warning: str | None
 ) -> None:
@@ -195,8 +228,8 @@ async def test_recovered_job_counts_elapsed_time_toward_soft_warnings(
     github = FakeGitHub(repo)
     deps = replace(
         job_deps(github, tmp_path),
-        hard_deadline_s=900,  # capped at 600: wrap-up is 60s before the effective hard limit
-        soft_deadline_s=540,
+        hard_deadline_s=MAX_REVIEW_S * 2,  # capped at MAX_REVIEW_S, which is what `remaining` counts down from
+        soft_deadline_s=DEFAULT_SOFT_S,
         agents=lambda ws: (
             correctness_agent(FunctionModel(lens), ws),
             verifier_agent(verifier_model(lambda f: True), ws),
@@ -301,25 +334,326 @@ async def test_an_advisory_lens_running_out_of_time_doesnt_withhold_approval(rep
     assert isinstance(result, Reviewed) and not result.outcome.cut_short
 
 
-async def test_the_hard_deadline_ends_the_review_without_a_verdict(repo: GitRepo, tmp_path: Path) -> None:
-    async def stuck(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        if len(messages) == 1:  # report one finding at once, then hang
-            return ModelResponse(parts=[ToolCallPart(REPORT_TOOL, {"finding": finding(5)})])
-        await asyncio.sleep(60)
-        raise AssertionError("cancelled long before this")
+async def stuck_lens(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    """Report one finding at once, then never answer again."""
+    if len(messages) == 1:
+        return ModelResponse(parts=[ToolCallPart(REPORT_TOOL, {"finding": finding(5)})])
+    return await never_answers(messages, info)
+
+
+def cut_off(
+    github: FakeGitHub, tmp_path: Path, agents: job.AgentFactory | None = None, lenses: tuple[Lens, ...] = ()
+) -> job.ReviewDeps:
+    """Deps whose checking cutoff comes after 0.9s (and the hard stop after 1s): fakes answer at once, so only
+    work that never answers is still running by then."""
+    deps = job_deps(github, tmp_path)
+    return replace(deps, agents=agents or deps.agents, hard_deadline_s=1.0, lenses=lenses)
+
+
+async def test_a_lens_stuck_at_the_cutoff_still_gets_a_verdict_from_what_was_judged(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """Until Nov 21 2026 this ended as "Review timed out": 7 of 9 live reviews lost their verdict that way."""
+    github = FakeGitHub(repo)
+    deps = cut_off(
+        github,
+        tmp_path,
+        agents=lambda ws: (
+            correctness_agent(FunctionModel(stuck_lens), ws),
+            verifier_agent(verifier_model(lambda f: True), ws),
+        ),
+    )
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("failure", "1 blocking issue(s)")
+    [review] = github.reviews
+    assert review["event"] == "REQUEST_CHANGES" and "**Partially reviewed:**" in review["body"]
+    assert [c.line for c in github.inline_comments] == [5]
+
+
+async def test_a_blocking_candidate_unchecked_at_the_cutoff_is_not_posted_and_not_approved(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    github = FakeGitHub(repo)
+    deps = cut_off(
+        github,
+        tmp_path,
+        agents=lambda ws: (
+            correctness_agent(lens_model([finding(5)]), ws),
+            verifier_agent(FunctionModel(never_answers), ws),
+        ),
+    )
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, pull(repo))
+    why = "the review ran out of time before checking 1 candidate finding(s)"
+    assert (result.conclusion, result.title) == ("neutral", "Partially reviewed")
+    assert why in result.summary and "The time limit left 1 candidate finding(s) unchecked." in result.summary
+    assert "will be checked again" not in result.summary  # nothing is saved to recheck it from
+    [review] = github.reviews
+    assert review["event"] == "COMMENT" and why in review["body"]
+    # Where to look, but not the claim: an unverified finding's text is never posted.
+    assert "Not checked before the time limit: `stats.py:5`." in review["body"]
+    assert finding(5)["title"] not in review["body"] and github.inline_comments == []
+    # The trail's own note about it gives the location too. (Its earlier "reported:" line, like the lens's
+    # tool call, still shows what was claimed: the trail is the log of the review.)
+    assert "not checked in time: stats.py:5" in result.details
+    assert f"not checked in time: {finding(5)['title']}" not in result.details
+
+
+async def test_what_was_confirmed_before_the_cutoff_still_blocks(repo: GitRepo, tmp_path: Path) -> None:
+    github = FakeGitHub(repo)
+    deps = cut_off(
+        github,
+        tmp_path,
+        agents=lambda ws: (
+            correctness_agent(lens_model([finding(5), finding(4, title="Total starts at the wrong value")]), ws),
+            verifier_agent(verifier_model(lambda f: True, stuck=lambda f: f["line"] == 4), ws),
+        ),
+    )
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("failure", "1 blocking issue(s)")
+    [review] = github.reviews
+    assert review["event"] == "REQUEST_CHANGES" and "`stats.py:4`" in review["body"]
+    assert [c.line for c in github.inline_comments] == [5]
+
+
+async def test_an_unchecked_security_candidate_prevents_approval(repo: GitRepo, tmp_path: Path) -> None:
+    """From the bot's review of #65: every lens that can block counts, not correctness alone."""
+    security = Lens(
+        "security", lambda ws: lens_pair("security", lens_model([finding(5)]), FunctionModel(never_answers), ws)
+    )
+    github = FakeGitHub(repo)
+    async with asyncio.timeout(5):
+        result = await review_and_post(cut_off(github, tmp_path, lenses=(security,)), pull(repo))
+    assert (result.conclusion, result.title) == ("neutral", "Partially reviewed")
+    [review] = github.reviews
+    assert review["event"] == "COMMENT" and "Not checked before the time limit: `stats.py:5`." in review["body"]
+    assert github.inline_comments == []
+
+
+async def test_a_candidate_from_a_lens_that_never_finished_is_still_counted_as_unchecked(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: the lens reported it along the way, then never returned its final report,
+    and its verifier never answered either. The candidate must not vanish with the lens."""
+    github = FakeGitHub(repo)
+    deps = cut_off(
+        github,
+        tmp_path,
+        agents=lambda ws: (
+            correctness_agent(FunctionModel(stuck_lens), ws),
+            verifier_agent(FunctionModel(never_answers), ws),
+        ),
+    )
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("neutral", "Partially reviewed")
+    [review] = github.reviews
+    assert review["event"] == "COMMENT" and "Not checked before the time limit: `stats.py:5`." in review["body"]
+
+
+async def test_a_confirmed_finding_being_posted_at_the_cutoff_is_posted_once_and_not_called_unchecked(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: its verdict was in and its comment was on the way to GitHub. Cutting the
+    write off would leave it unrecorded, so the verdict would post the same comment again."""
+    github = FakeGitHub(repo, comment_delay=3.7)  # still posting when checking stops waiting, at 3.6s
+    deps = replace(job_deps(github, tmp_path, [finding(5)]), hard_deadline_s=4.0)
+    async with asyncio.timeout(8):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("failure", "1 blocking issue(s)")
+    [review] = github.reviews
+    assert review["event"] == "REQUEST_CHANGES" and "Not checked" not in review["body"]
+    assert len(github.review_comments) == 1 and review["comments"] == []  # posted by itself, not again in the verdict
+
+
+async def test_a_confirmed_finding_waiting_its_turn_to_post_at_the_cutoff_goes_in_the_verdict(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: posts go one at a time. Only the one under way at the cutoff finishes; a
+    second started then would outlast the hard stop and cost the review its verdict."""
+    github = FakeGitHub(repo, comment_delay=3.7)  # the first post ends after checking stops waiting, at 3.6s
+    deps = replace(job_deps(github, tmp_path, [finding(5), finding(4)]), hard_deadline_s=4.0)
+    async with asyncio.timeout(8):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("failure", "2 blocking issue(s)")
+    [review] = github.reviews
+    assert review["event"] == "REQUEST_CHANGES" and "Not checked" not in review["body"]
+    assert len(github.review_comments) == 1 and len(review["comments"]) == 1  # each finding posted exactly once
+
+
+async def test_the_hard_stop_keeps_the_comments_already_posted(
+    repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From the bot's review of #65: the backstop still ends a review whose post never returns, without a
+    verdict, and what was posted before it stays."""
+    github = FakeGitHub(repo)
+    post = github.create_review_comment
+
+    async def second_never_returns(repo: Repo, number: int, *, commit_sha: str, comment: ReviewComment) -> None:
+        if github.review_comments:
+            await asyncio.Event().wait()
+        await post(repo, number, commit_sha=commit_sha, comment=comment)
+
+    monkeypatch.setattr(github, "create_review_comment", second_never_returns)
+    deps = replace(job_deps(github, tmp_path, [finding(5), finding(4)]), hard_deadline_s=1.0)
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.title, result.conclusion) == ("Review timed out", "neutral")
+    assert "Comments already posted remain." in result.summary
+    assert len(github.review_comments) == 1 and github.reviews == []
+
+
+async def test_an_earlier_verdict_does_not_stand_in_for_its_unchecked_replacement(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: a more urgent report for a line replaces the judged one. If only the
+    replacement is still unjudged at the cutoff, the review must not approve over it."""
+
+    async def lens(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        answered = sum(isinstance(message, ModelResponse) for message in messages)
+        if answered == 0:
+            return ModelResponse(parts=[ToolCallPart(REPORT_TOOL, {"finding": finding(5, priority=3)})])
+        if answered == 1:
+            await asyncio.sleep(0.3)  # the first report's verdict is in before the second is made
+            return ModelResponse(parts=[ToolCallPart(REPORT_TOOL, {"finding": finding(5, priority=1)})])
+        report = {"findings": [], "overall_correct": False, "reviewed": ["stats.py"]}
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, report)])
+
+    github = FakeGitHub(repo)
+    deps = cut_off(
+        github,
+        tmp_path,
+        agents=lambda ws: (
+            correctness_agent(FunctionModel(lens), ws),
+            verifier_agent(verifier_model(lambda f: True, stuck=lambda f: f["priority"] == 1), ws),
+        ),
+    )
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("neutral", "Partially reviewed")
+    [review] = github.reviews
+    assert review["event"] == "COMMENT" and "Not checked before the time limit: `stats.py:5`." in review["body"]
+
+
+async def test_a_replaced_report_still_being_verified_does_not_hold_the_cutoff_open(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: the replacement's verdict is in, and the report it replaced shares its
+    line. Only a task with its own verdict is left to finish; the stale one is cancelled like any other."""
+
+    async def lens(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        answered = sum(isinstance(message, ModelResponse) for message in messages)
+        if answered < 2:  # first a minor report whose verifier never answers, then a blocking one for the line
+            return ModelResponse(parts=[ToolCallPart(REPORT_TOOL, {"finding": finding(5, priority=3 - 2 * answered)})])
+        report = {"findings": [], "overall_correct": False, "reviewed": ["stats.py"]}
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, report)])
+
+    github = FakeGitHub(repo)
+    deps = cut_off(
+        github,
+        tmp_path,
+        agents=lambda ws: (
+            correctness_agent(FunctionModel(lens), ws),
+            verifier_agent(verifier_model(lambda f: True, stuck=lambda f: f["priority"] == 3), ws),
+        ),
+    )
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, pull(repo))
+    assert (result.conclusion, result.title) == ("failure", "1 blocking issue(s)")
+    [review] = github.reviews
+    assert review["event"] == "REQUEST_CHANGES" and "Not checked" not in review["body"]
+
+
+async def test_an_advisory_check_unfinished_at_the_cutoff_does_not_withhold_approval(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """Advisory lenses can never block a merge, so their unfinished checks must not hold the verdict either."""
+    dry = Lens(
+        "dry",
+        lambda ws: lens_pair("dry", lens_model([finding(5)]), FunctionModel(never_answers), ws),
+        whole_pr=False,
+    )
+    github = FakeGitHub(repo)
+    async with asyncio.timeout(5):
+        result = await review_and_post(cut_off(github, tmp_path, lenses=(dry,)), pull(repo))
+    assert (result.conclusion, result.title) == ("success", "No blocking issues")
+    [review] = github.reviews
+    assert review["event"] == "APPROVE" and "Not checked" not in review["body"] and github.inline_comments == []
+    assert "1 dry candidate(s) not checked in time: dropped" in result.details  # counted, not described
+
+
+async def test_a_recovered_job_past_the_cutoff_starts_no_lens_and_does_not_approve(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: with less left than posting needs, no model is called. This lens would
+    answer at once with a clean report, which must not become an approval of a change nobody had time to read."""
+    asked: list[int] = []
+
+    def clean_at_once(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        asked.append(len(messages))
+        report = {"findings": [], "overall_correct": True, "reviewed": ["stats.py"]}
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, report)])
 
     github = FakeGitHub(repo)
     deps = replace(
-        job_deps(github, tmp_path, []),
+        job_deps(github, tmp_path),
         agents=lambda ws: (
-            correctness_agent(FunctionModel(stuck), ws),
+            correctness_agent(FunctionModel(clean_at_once), ws),
             verifier_agent(verifier_model(lambda f: True), ws),
         ),
-        hard_deadline_s=0.5,
     )
-    result = await review_and_post(deps, pull(repo))
-    assert result.title == "Review timed out" and github.reviews == []
-    assert [c.line for c in github.inline_comments] == [5]  # confirmed before the deadline: still posted
+    result = await review_and_post(deps, pull(repo), remaining_s=POSTING_RESERVE_S / 2)
+    assert asked == []
+    assert (result.conclusion, result.title) == ("neutral", "Partially reviewed")
+    assert [r["event"] for r in github.reviews] == ["COMMENT"] and github.inline_comments == []
+
+
+def test_the_cutoff_leaves_time_to_post() -> None:
+    assert checking_cutoff(MAX_REVIEW_S) == MAX_REVIEW_S - POSTING_RESERVE_S
+    assert checking_cutoff(10) == 9  # a budget too short for the full reserve keeps a tenth
+
+
+async def test_work_is_cancelled_at_the_cutoff_and_only_then() -> None:
+    cancelled = asyncio.Event()
+
+    async def forever() -> str:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+        return "never"
+
+    async def quick() -> str:
+        return "done"
+
+    async def times_out_itself() -> str:
+        raise TimeoutError("the model server's own timeout")
+
+    assert await before_cutoff(Deadline(soft_s=60, checking_s=0.05), forever) is None and cancelled.is_set()
+    assert await before_cutoff(Deadline(soft_s=60, checking_s=60), quick) == "done"
+    assert await before_cutoff(None, quick) == "done" and await before_cutoff(Deadline(soft_s=60), quick) == "done"
+    with pytest.raises(TimeoutError, match="own timeout"):  # not mistaken for the cutoff
+        await before_cutoff(Deadline(soft_s=60, checking_s=60), times_out_itself)
+
+    # Past the cutoff the work is not begun at all: even work that would finish at once returns nothing.
+    passed, begun = Deadline(soft_s=60, checking_s=0), Mock(side_effect=quick)
+    assert await before_cutoff(passed, begun) is None
+    begun.assert_not_called()
+
+    tasks = [asyncio.create_task(quick()), asyncio.create_task(forever())]
+    assert await until_cutoff(Deadline(soft_s=60, checking_s=0.05), tasks) == [tasks[1]] and tasks[1].cancelled()
+    assert await until_cutoff(None, [asyncio.create_task(quick())]) == [] and await until_cutoff(passed, []) == []
+
+    # Nor is a task created just before a wait that starts past the cutoff ever begun.
+    ran: list[str] = []
+
+    async def runs() -> None:
+        ran.append("its first step")
+
+    late = asyncio.create_task(runs())
+    assert await until_cutoff(passed, [late]) == [late] and late.cancelled() and not ran
 
 
 async def test_a_push_mid_review_stops_it_instead_of_finishing(

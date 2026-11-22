@@ -58,7 +58,8 @@ class Settings:
     soft_deadline_minutes: float = DEFAULT_SOFT_S / 60
     """After this, every lens wraps up with what it has; a review cut short never approves."""
     hard_deadline_minutes: float = MAX_REVIEW_S / 60
-    """After this, the review is cancelled without a verdict (findings already posted stay)."""
+    """The attempt's whole budget. Checking stops shortly before it (deadline.checking_cutoff) so the verdict is
+    posted from what was judged; at the limit itself whatever still runs is cancelled, without a verdict."""
     model_lanes: Mapping[str, int] = field(default_factory=lambda: dict(DEFAULT_MODEL_LANES))
     """At most this many requests at once to each model, across every review (PRISM_MODEL_LANES,
     "model=n,..."; defaults in servers.DEFAULT_MODEL_LANES). Models not listed are unlimited."""
@@ -206,14 +207,15 @@ def models_from(env: Mapping[str, str]) -> dict[str, str]:
 def deadlines_from(env: Mapping[str, str]) -> tuple[float, float]:
     """Return (soft, hard) minutes for the receiver and evals. Both settings must be positive and finite.
 
-    Cap the hard limit at `deadline.MAX_REVIEW_S` and the soft limit at 90% of the effective hard limit.
+    Cap the hard limit at `deadline.MAX_REVIEW_S`, and the soft limit at the same share of the effective hard
+    limit that the defaults use, so checking what the lenses found always keeps its share of the time.
     """
     soft = float(env.get("PRISM_SOFT_DEADLINE_MINUTES", Settings.soft_deadline_minutes))
     hard = float(env.get("PRISM_HARD_DEADLINE_MINUTES", Settings.hard_deadline_minutes))
     if not all(math.isfinite(value) and value > 0 for value in (soft, hard)):
         raise ValueError("review deadlines must be positive finite minutes")
     hard = min(hard, MAX_REVIEW_S / 60)
-    return min(soft, hard * 0.9), hard
+    return min(soft, hard * DEFAULT_SOFT_S / MAX_REVIEW_S), hard
 
 
 def reasoning_from(env: Mapping[str, str]) -> dict[str, ReasoningEffort]:

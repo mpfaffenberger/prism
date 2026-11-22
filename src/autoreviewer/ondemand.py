@@ -24,10 +24,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from autoreviewer.github import PublicGitHub, PullRequestReader, Repo
-from autoreviewer.review.deadline import Deadline
+from autoreviewer.review.deadline import Deadline, checking_cutoff
 from autoreviewer.review.job import AgentFactory, CheckResult, Lens, Reviewed, review_change
 from autoreviewer.review.pipeline import BLOCK_AT_PRIORITY, Outcome
-from autoreviewer.review.render import comment_body
+from autoreviewer.review.render import comment_body, location
 from autoreviewer.review.simplify import SimplifierFactory
 from autoreviewer.review.workspace import PublicSource, RepoSource
 
@@ -80,18 +80,24 @@ class Report:
         lines = [header, f"**Verdict: {verdict}** (nothing was posted to GitHub)\n"]
         for finding in outcome.posted:
             body = comment_body(finding, blocking=outcome.is_blocking(finding))
-            lines.append(f"## `{finding.path}:{finding.line}`\n\n{body}\n")
-        if outcome.unverified:
-            lines.append(f"**{len(outcome.unverified)} candidate(s) could not be verified** (the verifier failed):\n")
-            lines.extend(f"- `{f.path}:{f.line}` {f.title}: {reason}" for f, reason in outcome.unverified)
+            lines.append(f"## {location(finding.path, finding.line)}\n\n{body}\n")
+        if unchecked := outcome.unchecked:
+            lines.append(f"**{len(unchecked)} candidate(s) were not checked before the time limit** (never posted):\n")
+            lines.extend(f"- {location(f.path, f.line)}" for f in unchecked)  # where, not the unverified claim
+            lines.append("")
+        if failed := outcome.verifier_failed:
+            lines.append(f"**{len(failed)} candidate(s) could not be verified** (the verifier failed):\n")
+            lines.extend(f"- {location(f.path, f.line)} {f.title}: {reason}" for f, reason in failed)
             lines.append("")
         if outcome.low_confidence:
             lines.append(f"{len(outcome.low_confidence)} low-confidence candidate(s) were not verified:\n")
-            lines.extend(f"- `{f.path}:{f.line}` {f.title} (confidence {f.confidence})" for f in outcome.low_confidence)
+            lines.extend(
+                f"- {location(f.path, f.line)} {f.title} (confidence {f.confidence})" for f in outcome.low_confidence
+            )
             lines.append("")
         if outcome.rejected:
             lines.append(f"<details><summary>{len(outcome.rejected)} candidate(s) dropped by verification</summary>\n")
-            lines.extend(f"- `{f.path}:{f.line}` {f.title}: {reason}" for f, reason in outcome.rejected)
+            lines.extend(f"- {location(f.path, f.line)} {f.title}: {reason}" for f, reason in outcome.rejected)
             lines.append("</details>")
         return "\n".join(lines) + "\n"
 
@@ -157,7 +163,9 @@ def run(argv: list[str] | None = None) -> int:
             block_at=settings.block_at_priority,
             simplifier=simplifier_agents(plan) if settings.simplify else None,
             lenses=build_lenses(settings, plan),
-            deadline=Deadline(settings.soft_deadline_minutes * 60),
+            deadline=Deadline(
+                settings.soft_deadline_minutes * 60, checking_s=checking_cutoff(settings.hard_deadline_minutes * 60)
+            ),
         )
         report = asyncio.run(asyncio.wait_for(review, settings.hard_deadline_minutes * 60))
     except Exception as error:  # any failure is an error, never a verdict

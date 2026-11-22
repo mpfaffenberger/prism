@@ -23,9 +23,9 @@ from autoreviewer.review.diff import (
 )
 from autoreviewer.review.gittools import git_tools
 from autoreviewer.review.job import _summary, finish_check, review_and_post, start_check
-from autoreviewer.review.pipeline import PullRequestText, lens_prompt, review
+from autoreviewer.review.pipeline import OUT_OF_TIME, Outcome, PullRequestText, lens_prompt, review
 from autoreviewer.review.posting import VERDICT_MARKER
-from autoreviewer.review.render import comment_body, sanitize
+from autoreviewer.review.render import MAX_PATH, code_span, comment_body, location, review_body, sanitize
 from autoreviewer.review.schemas import Finding
 from autoreviewer.review.workspace import BASE, HEAD, Workspace, read_changes, run_git
 from autoreviewer.web.routing import PullRequestUpdated
@@ -215,6 +215,44 @@ async def test_a_bug_requests_changes_with_an_inline_comment(repo: GitRepo, tmp_
     assert (result.conclusion, result.title) == ("failure", "1 blocking issue(s)")
 
 
+@pytest.mark.parametrize(
+    ("name", "span"),
+    [
+        ("stats.py:5", "`stats.py:5`"),
+        ("a`b.py:5", "``a`b.py:5``"),
+        ("`x``y`:5", "``` `x``y`:5 ```"),  # padded on both sides: Markdown strips one space from each
+        ("end`", "`` end` ``"),
+        ("two\nlines.py:5", "`two lines.py:5`"),
+        ("tab\t\r\nhere.py:5", "`tab here.py:5`"),
+        ("two  spaces.py:5", "`two  spaces.py:5`"),  # a file's own spaces are part of its name
+    ],
+)
+def test_a_file_name_cannot_close_its_code_span(name: str, span: str) -> None:
+    """From the bot's review of #65: the PR's author picks the file names the bot's review then prints."""
+    assert code_span(name) == span
+
+
+def test_a_long_path_is_clipped_before_its_line_number() -> None:
+    """From the bot's review of #65: clipping the whole location lost the line."""
+    assert location("stats.py", 5) == "`stats.py:5`"
+    assert location("d/" * 300 + "stats.py", 5) == f"`{('d/' * 300)[: MAX_PATH - 1]}…:5`"
+
+
+def test_an_unchecked_candidate_on_a_hostile_file_name_stays_inside_its_span() -> None:
+    hostile = "x`[approve](https://evil.example) @octocat `.py"
+    unchecked = Finding.model_validate({**finding(5, path=hostile), "kind": "correctness"})
+    body = review_body(Outcome(unverified=[(unchecked, OUT_OF_TIME)], cut_short=True), footer="footer")
+    assert f"``{sanitize(hostile)}:5``" in body and "@octocat" not in body  # no ping, and the span holds
+
+
+def test_a_finding_outside_the_diff_on_a_hostile_file_name_stays_inside_its_span() -> None:
+    """From the bot's review of #65: the list of findings outside the changed lines prints file names too."""
+    hostile = "x`[approve](https://evil.example) @octocat `.py"
+    outside = Finding.model_validate({**finding(5, path=hostile), "kind": "correctness"})
+    body = review_body(Outcome(general=[outside]), footer="footer")
+    assert f"- ``{sanitize(hostile)}:5``: " in body and "@octocat" not in body
+
+
 async def test_a_clean_pr_is_approved(repo: GitRepo, tmp_path: Path) -> None:
     github = FakeGitHub(repo)
     result = await review_and_post(job_deps(github, tmp_path, []), pull(repo))
@@ -233,8 +271,9 @@ async def test_expiring_after_a_blocking_verdict_preserves_the_failed_check(
 
     cleanup = AsyncMock(side_effect=hang)
     monkeypatch.setattr(f"autoreviewer.review.job.{hung}", cleanup)
+    deps = replace(job_deps(github, tmp_path, [finding(5)]), hard_deadline_s=1.5)  # the hung cleanup outlasts it
     async with asyncio.timeout(5):
-        result = await review_and_post(job_deps(github, tmp_path, [finding(5)]), pull(repo), 1, remaining_s=1)
+        result = await review_and_post(deps, pull(repo), 1)
 
     cleanup.assert_awaited_once()
     assert [r["event"] for r in github.reviews] == ["REQUEST_CHANGES"]

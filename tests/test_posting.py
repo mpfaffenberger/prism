@@ -11,8 +11,9 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart, ToolReturnPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from autoreviewer.github import Repo, ReviewComment
+from autoreviewer.github import PostedComment, Repo, ReviewComment
 from autoreviewer.review.agents import REPORT_TOOL, correctness_agent, verifier_agent
+from autoreviewer.review.deadline import Deadline
 from autoreviewer.review.job import review_and_post
 from autoreviewer.review.pipeline import Outcome, review
 from autoreviewer.review.posting import Publisher, fingerprint, post_review
@@ -33,6 +34,34 @@ def confirmed(line: int = 5, *, kind: str = "correctness", priority: int = 1) ->
 
 def publisher(github: FakeGitHub) -> Publisher:
     return Publisher(github, REPO, 7, head_sha=github.repo.head, author=BOT, block_at=1)
+
+
+async def test_no_comment_is_posted_once_the_checking_cutoff_has_come(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From the bot's review of #65: the cutoff can come while the publisher reads the PR's comments. It then
+    starts no write, and the finding stays unposted for the verdict to carry. A comment already on the PR is
+    still recognised, so the verdict doesn't repeat it."""
+    github = FakeGitHub(repo)
+    read = github.posted_comments
+
+    async def slow_read(repo: Repo, number: int, *, author: str) -> list[PostedComment]:
+        await asyncio.sleep(0.2)
+        return await read(repo, number, author=author)
+
+    def until(checking_s: float) -> Publisher:
+        deadline = Deadline(soft_s=60, checking_s=checking_s)
+        return Publisher(github, REPO, 7, head_sha=github.repo.head, author=BOT, block_at=1, deadline=deadline)
+
+    monkeypatch.setattr(github, "posted_comments", slow_read)
+    late = until(0.1)  # in time when its turn comes, past the cutoff once the read is back
+    await late(confirmed())
+    assert github.review_comments == [] and late.posted == {}
+
+    await until(60)(confirmed())
+    replayed = until(0)
+    await replayed(confirmed())
+    assert len(github.review_comments) == 1 and len(replayed.posted) == 1
 
 
 async def test_each_finding_is_posted_once_even_when_a_review_is_replayed(repo: GitRepo) -> None:

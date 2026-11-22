@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from pydantic_ai.models.function import FunctionModel
 
 from autoreviewer.review import job
+from autoreviewer.review.agents import correctness_agent, lens_pair, verifier_agent
 from autoreviewer.review.job import Lens, review_and_post
 from autoreviewer.review.lint import LintError
 from autoreviewer.review.memory import ReviewMemory
@@ -15,7 +18,18 @@ from autoreviewer.review.pipeline import Outcome
 from autoreviewer.review.posting import Publisher, settle_fixed
 from autoreviewer.review.schemas import Finding
 from autoreviewer.web.routing import PullRequestUpdated
-from tests.review_fakes import BOT, FakeGitHub, GitRepo, add_commit, finding, job_deps, lens_agents
+from tests.review_fakes import (
+    BOT,
+    FakeGitHub,
+    GitRepo,
+    add_commit,
+    finding,
+    job_deps,
+    lens_agents,
+    lens_model,
+    never_answers,
+    verifier_model,
+)
 from tests.test_withdrawals import REPO, blocking, reviewed
 
 pytestmark = pytest.mark.anyio
@@ -117,6 +131,30 @@ async def test_the_bots_review_resolves_them_and_never_fails_for_it(
     result = await review_and_post(job_deps(github, tmp_path, []), pull)
     assert (result.conclusion, github.reviews[-1]["event"]) == ("success", "APPROVE")
     assert github.settled_threads == (set() if threads_fail else {"T1"})
+
+
+@pytest.mark.parametrize("cut_off", ["a lens before its report", "an advisory candidate, dropped unjudged"])
+async def test_a_review_the_time_limit_cut_off_resolves_nothing_it_did_not_finish(
+    repo: GitRepo, tmp_path: Path, cut_off: str
+) -> None:
+    """From the bot's review of #65: a lens that never reported didn't read the file in full, and a candidate
+    dropped unjudged may be the earlier finding found again. Neither makes that finding "fixed"."""
+    kind = "correctness" if cut_off == "a lens before its report" else "dry"
+    github = FakeGitHub(repo)
+    await Publisher(github, REPO, 7, head_sha="a" * 40, author=BOT, block_at=1)(blocking(5, kind=kind))
+    github.review_comments[0]["outdated"] = True  # an earlier head's finding; the push changed the code under it
+    stuck, working = FunctionModel(never_answers), verifier_model(lambda f: True)
+    # Checking stops waiting at 0.9s. With memory, as the bot runs: a cut-short review must not lean on it.
+    deps = replace(job_deps(github, tmp_path), hard_deadline_s=1.0, memory=ReviewMemory(tmp_path / "steps"))
+    if kind == "correctness":
+        deps = replace(deps, agents=lambda ws: (correctness_agent(stuck, ws), verifier_agent(working, ws)))
+    else:
+        dry = Lens("dry", lambda ws: lens_pair("dry", lens_model([finding(5)]), stuck, ws), whole_pr=False)
+        deps = replace(deps, lenses=(dry,))
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, PullRequestUpdated(1, "mpfaffenberger", "demo", 7, repo.head))
+    assert result.title == ("Partially reviewed" if kind == "correctness" else "No blocking issues")
+    assert github.settled_threads == set() and len(github.review_comments) == 1  # no thread settled, no note
 
 
 ELSEWHERE = Finding.model_validate({**finding(3), "kind": "dry", "path": "notes.py"}).model_dump()

@@ -234,11 +234,27 @@ Every lens gets one shared scope rule (`agents.FOCUS`): review the lines the PR 
 affect, and read the rest of the codebase only to understand them. Runaway reviews were scope drift, or a model stuck in a loop: verifiers get an 80-step budget
 and every agent the harness's `DetectLoops`, so the deadlines are only a backstop.
 
-`review/deadline.py`: the **soft deadline** defaults to 9 minutes (`PRISM_SOFT_DEADLINE_MINUTES`),
-capped at 90% of the hard deadline. With five minutes left, lenses are asked to focus; with one minute
-left, they lose their tools and must report what they found. Both windows shrink for shorter budgets. After the **hard deadline** (`PRISM_HARD_DEADLINE_MINUTES`, at most 10 per attempt) the job cancels the review:
-"Review timed out", no verdict, and findings already posted stay. A review whose correctness or security lens was cut short, or failed outright (a model error after the
-client's retries), **never approves**: it requests changes if it found blocking issues, and otherwise
+`review/deadline.py`: the **soft deadline** defaults to 15 minutes (`PRISM_SOFT_DEADLINE_MINUTES`),
+capped at three quarters of the hard deadline so checking keeps its share. With five minutes left, lenses
+are asked to focus; with one minute left, they lose their tools and must report what they found. Both
+windows shrink for shorter budgets.
+
+The **checking cutoff** leaves one minute for posting, or one tenth of the hard deadline if that is
+shorter. Checking stops waiting there, and the
+verdict is posted from what was judged by then. A lens that still hasn't reported counts as cut short.
+A candidate still unjudged is never posted: from correctness or security it is recorded as unchecked,
+the review lists its location (not its text) and can't approve; from an advisory lens, or a
+simplification, it is dropped, since those can never block. A confirmed finding whose comment is being
+posted finishes posting; one still waiting its turn to post goes into the verdict review instead. The
+check's activity trail is the log of the review, not its findings: it shows what each lens reported, for
+every candidate, whatever became of it. Until Nov 21 2026 every check was awaited: at 9 and 10 minutes a lens's last report landed seconds before the
+hard stop, and 7 of 9 live reviews ended with no verdict.
+
+The **hard deadline** (`PRISM_HARD_DEADLINE_MINUTES`, at most 20 per attempt) is the backstop. The job
+cancels whatever still runs, for example a post that has not returned. If no verdict was posted, the check
+ends as "Review timed out". Prism keeps any verdict or findings already posted. A review whose correctness or security lens was cut short, left a candidate unchecked, or failed
+outright (a model error after the client's retries), **never approves**: it requests changes if it found
+blocking issues, and otherwise
 posts a neutral COMMENT ("partially reviewed") with a neutral check, and isn't remembered for continuing
 (files it never read wouldn't count as changed since). The CLI exits 3 for it, and the evals use the
 bot's limits.

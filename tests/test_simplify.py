@@ -3,23 +3,27 @@ a second model, and posted as GitHub suggestions that never block."""
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic_ai.models.function import FunctionModel
 
+from autoreviewer.review.agents import simplify_agent, simplify_checker_agent
+from autoreviewer.review.deadline import Deadline
 from autoreviewer.review.diff import ChangedPath
 from autoreviewer.review.job import review_and_post
 from autoreviewer.review.pipeline import PullRequestText
 from autoreviewer.review.progress import Progress
 from autoreviewer.review.render import comment_body
 from autoreviewer.review.schemas import Finding
-from autoreviewer.review.simplify import simplify, suggest
+from autoreviewer.review.simplify import Simplifier, simplify, suggest
 from autoreviewer.review.workspace import Workspace
 from autoreviewer.web.routing import PullRequestUpdated
-from tests.review_fakes import FakeGitHub, GitRepo, add_commit, job_deps, simplifier
+from tests.review_fakes import FakeGitHub, GitRepo, add_commit, job_deps, never_answers, simplifier
 
 pytestmark = pytest.mark.anyio
 
@@ -162,6 +166,59 @@ async def test_simplifications_never_block_and_post_as_multi_line_suggestions(re
     assert "```suggestion\n" + TIGHT + "\n```" in comment.body
     summary = "1 optional one-click simplification(s), cutting 5 line(s) (56% of the 9 added)."  # 2 added elsewhere
     assert summary in review["body"]
+
+
+@pytest.mark.parametrize("stuck", ["proposer", "checker"])
+async def test_simplifications_unfinished_at_the_checking_cutoff_are_not_posted(tmp_path: Path, stuck: str) -> None:
+    """They are optional: whichever model is still working when checking stops, the review goes on without them."""
+    workspace = Workspace(tmp_path, "b", "h")
+    working = simplifier([cut()])(workspace)
+    never = FunctionModel(never_answers)
+    stalled = replace(
+        working,
+        propose=simplify_agent(never, workspace) if stuck == "proposer" else working.propose,
+        check=simplify_checker_agent(never, workspace) if stuck == "checker" else working.check,
+    )
+    progress = Progress()
+    deadline = Deadline(soft_s=60, checking_s=0.3)
+    async with asyncio.timeout(5):  # without the cutoff this would wait forever
+        found = await suggest(added_file(tmp_path), stalled, tmp_path, progress, deadline=deadline)
+    assert found == []
+    note = "simplifications not proposed in time" if stuck == "proposer" else "1 simplification(s) not checked in time"
+    assert note in progress.activity
+
+
+async def test_a_suggestion_being_posted_at_the_cutoff_finishes_posting(tmp_path: Path) -> None:
+    """From the bot's review of #65: its check was done and its post was under way. Cutting that off would
+    leave a comment GitHub has but the review doesn't know about, to be posted again with the verdict."""
+    posted: list[Finding] = []
+
+    async def publish(finding: Finding) -> None:
+        await asyncio.sleep(0.6)  # still posting when checking stops waiting, at 0.3s
+        posted.append(finding)
+
+    working = simplifier([cut()])(Workspace(tmp_path, "b", "h"))
+    deadline = Deadline(soft_s=60, checking_s=0.3)
+    async with asyncio.timeout(5):
+        found = await suggest(added_file(tmp_path), working, tmp_path, Progress(), publish=publish, deadline=deadline)
+    assert len(found) == 1 and posted == found
+
+
+async def test_a_stalled_simplification_check_does_not_hold_up_the_verdict(repo: GitRepo, tmp_path: Path) -> None:
+    """From the bot's review of #65: the job has to hand its deadline to the simplifier, or an optional
+    suggestion's checker could keep the verdict waiting until the hard stop."""
+    head = add_commit(repo, {"parity.py": BLOATED})
+    github = FakeGitHub(replace(repo, head=head))
+
+    def stalled(workspace: Workspace) -> Simplifier:
+        working = simplifier([cut()])(workspace)
+        return replace(working, check=simplify_checker_agent(FunctionModel(never_answers), workspace))
+
+    deps = replace(job_deps(github, tmp_path), simplifier=stalled, hard_deadline_s=1.0)
+    async with asyncio.timeout(5):
+        result = await review_and_post(deps, PullRequestUpdated(1, "mpfaffenberger", "demo", 7, head))
+    assert (result.conclusion, result.title) == ("success", "No blocking issues")
+    assert [r["event"] for r in github.reviews] == ["APPROVE"] and github.inline_comments == []
 
 
 async def test_any_failure_costs_only_the_suggestions(tmp_path: Path) -> None:

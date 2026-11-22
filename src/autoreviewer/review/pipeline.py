@@ -21,6 +21,7 @@ from pydantic_ai.toolsets import FunctionToolset
 from autoreviewer.review.agents import FOCUS, LENS_LIMITS, LENS_RULES, REPORT_TOOL, VERIFIER_LIMITS
 from autoreviewer.review.checkpoints import Ran
 from autoreviewer.review.compaction import compaction_stats
+from autoreviewer.review.deadline import Deadline, Finishing, before_cutoff, until_cutoff
 from autoreviewer.review.diff import ChangedPath, commentable_lines
 from autoreviewer.review.memory import PriorReview
 from autoreviewer.review.progress import Progress
@@ -39,6 +40,8 @@ MIN_CONFIDENCE = 4
 """Findings below this confidence (PR-Agent's "a hunch") aren't worth a verifier call."""
 BLOCK_AT_PRIORITY = 1
 """Confirmed findings at this priority or more urgent (P0, P1) block the merge; the rest are advisory."""
+OUT_OF_TIME = "ran out of time"
+"""Why a candidate is unverified when the deadline cut its verification off (Outcome.unchecked)."""
 MAX_DESCRIPTION_CHARS = 4000
 MAX_LISTED_FILES = 300
 VERIFY_CONCURRENCY = 3
@@ -119,6 +122,9 @@ class Outcome:
     withdrawn: tuple[Withdrawal, ...] = ()
     """Findings withdrawn in conversation on unchanged code (posting.Publisher.withdrawn): one found again is not
     posted again, and doesn't block."""
+    cut: set[str] = field(default_factory=set[str])
+    """Kinds whose checking the deadline cut off (deadline.py): not every candidate of theirs was judged. A
+    kind that can block leaves the review cut short; an advisory one only loses the candidates in question."""
     standing: bool = False
     """An earlier review of this same commit left a blocking finding that still stands
     (posting.Publisher.standing): unchanged code can't be approved over it, whatever this review found."""
@@ -137,7 +143,20 @@ class Outcome:
         """Why a cut-short review covers only part of the change."""
         if failed := self.failed_blocking:
             return f"the {' and '.join(failed)} review failed"
+        if unchecked := self.unchecked:
+            return f"the review ran out of time before checking {len(unchecked)} candidate finding(s)"
         return "the review hit its time limit before covering the whole change"
+
+    @property
+    def unchecked(self) -> list[Finding]:
+        """Candidates from lenses that can block whose verification the deadline cut off. They are neither
+        posted nor dismissed, so the review can't approve over them."""
+        return [finding for finding, why in self.unverified if why == OUT_OF_TIME]
+
+    @property
+    def verifier_failed(self) -> list[tuple[Finding, str]]:
+        """The rest of `unverified`: candidates whose verifier raised, each with why."""
+        return [(finding, why) for finding, why in self.unverified if why != OUT_OF_TIME]
 
     @property
     def reported(self) -> list[Finding]:
@@ -160,6 +179,7 @@ class Outcome:
         self.rejected += other.rejected
         self.unverified += other.unverified
         self.failed |= other.failed
+        self.cut |= other.cut
         self.covered |= other.covered
         self.merged += other.merged
         self.low_confidence += other.low_confidence
@@ -349,15 +369,20 @@ class Judge:
         publish: Publish | None = None,
         limit: int = MAX_FINDINGS,
         sessions: RoleSessions | None = None,
+        deadline: Deadline | None = None,
     ) -> None:
-        """`limit`: how many findings are verified at most, counting only those past the free filters."""
+        """`limit`: how many findings are verified at most, counting only those past the free filters.
+        `deadline`: its checking cutoff ends the wait for verdicts (see `finish`)."""
         self._pr, self._verifier, self._progress, self._outcome = pr, verifier, progress, outcome
         self._kind: Literal["correctness"] | LensKind = kind
         self._label, self._publish, self._limit = label, publish, limit
-        self._sessions = sessions
+        self._sessions, self._deadline = sessions, deadline
         self._reviewable = {change.path for change in pr.reviewable}
         self._slots = asyncio.Semaphore(VERIFY_CONCURRENCY)
-        self._tasks: list[asyncio.Task[None]] = []
+        self._tasks: dict[asyncio.Task[None], Finding] = {}
+        self._judged = Finishing()
+        """Verifications with their verdict in, which only have their finding left to post. Per task, not per
+        line: a replaced report's task shares its line with the replacement and must not pass for it."""
         self._latest: dict[tuple[str, int], Finding] = {}
         """The most urgent finding reported for each line: only its verdict counts."""
         self._filtered: set[tuple[str, int]] = set()
@@ -412,7 +437,7 @@ class Judge:
             self._outcome.unverified[:] = [(f, why) for f, why in self._outcome.unverified if (f.path, f.line) != key]
             self._outcome.rejected[:] = [(f, why) for f, why in self._outcome.rejected if (f.path, f.line) != key]
         self._latest[key] = finding
-        self._tasks.append(asyncio.create_task(self._verify(finding)))
+        self._tasks[asyncio.create_task(self._verify(finding))] = finding
         self._progress.note(f"reported: {finding.title}")
         return "Recorded: it is being verified now and will be posted if confirmed. Keep reviewing."
 
@@ -423,12 +448,29 @@ class Judge:
             records.append(record)
 
     async def finish(self, findings: list[Finding]) -> None:
-        """Verify the final report's findings that weren't reported along the way, and wait for every verdict."""
+        """Verify the final report's findings that weren't reported along the way, and wait for their verdicts
+        until the checking cutoff. A candidate still unjudged then is not posted: from a lens that can block
+        it is recorded as unchecked, which keeps the review from approving; an advisory one is dropped."""
         for finding in _dedupe(findings):
             self.submit(finding)
         if pending := [task for task in self._tasks if not task.done()]:
             self._progress.set_phase(f"Verifying {len(pending)} candidate finding(s)")
-        await asyncio.gather(*self._tasks)
+        # A candidate with its verdict in is only being posted: that write completes, so the comment and the
+        # record of it can't come apart (a cancelled post that still reached GitHub would be posted twice).
+        cut = await until_cutoff(self._deadline, self._tasks, finishing=self._judged)
+        # A report a more urgent one replaced isn't a candidate any more: only its replacement counts.
+        unjudged = [f for f in map(self._tasks.__getitem__, cut) if self._latest.get((f.path, f.line)) is f]
+        if not unjudged:
+            return
+        self._outcome.cut.add(self._kind)
+        # This note says where, as the review will. (The trail above it shows what each lens reported, as it
+        # does for every candidate: it is the log of the review, not its findings.)
+        if self._kind in ADVISORY_KINDS:
+            self._progress.note(f"{len(unjudged)} {self._kind} candidate(s) not checked in time: dropped")
+            return
+        for finding in unjudged:
+            self._progress.note(f"not checked in time: {finding.path}:{finding.line}")
+            self._outcome.unverified.append((finding, OUT_OF_TIME))
 
     def cancel(self) -> None:
         for task in self._tasks:
@@ -450,6 +492,7 @@ class Judge:
         self._progress.note(f"{'confirmed' if verdict.confirmed else 'rejected'}: {finding.title}")
         if self._latest.get((finding.path, finding.line)) is not reported:
             return  # a more urgent report for this line superseded it while it was being verified
+        self._judged.mark()
         if not verdict.confirmed:
             self._outcome.rejected.append((finding, verdict.reason))
             return
@@ -468,12 +511,19 @@ LensRun = Callable[[list[FunctionToolset[None]], Callable[[list[ModelMessage]], 
 """Starts a lens run with these extra toolsets, and what to call with its history if it resumes after a restart."""
 
 
-async def _run_judged(judge: Judge, run: LensRun, *, report_as_you_go: bool = True) -> Ran[LensReport]:
+async def _run_judged(
+    judge: Judge, run: LensRun, *, label: str, deadline: Deadline | None = None, report_as_you_go: bool = True
+) -> Ran[LensReport] | None:
     """Run a lens (with `report_finding` if it reports as it goes), then judge its final report; no verification
-    outlives a failure."""
+    outlives a failure.
+
+    None if the checking cutoff arrived before the lens reported. What it reported along the way is still
+    judged, and `label` joins the lenses that were cut off, since it never said what it covered."""
     try:
-        result = await run([judge.toolset()] if report_as_you_go else [], judge.replay)
-        await judge.finish(result.output.findings)
+        result = await before_cutoff(deadline, lambda: run([judge.toolset()] if report_as_you_go else [], judge.replay))
+        if result is None and deadline is not None:  # None means its cutoff fired; the second test is for Pyright
+            deadline.wrapped_up.add(label)
+        await judge.finish(result.output.findings if result else [])
     except BaseException:
         judge.cancel()
         raise
@@ -493,6 +543,7 @@ async def review_lens(
     capabilities: Sequence[AbstractCapability[None]] = (),
     max_posted: int = MAX_FINDINGS,
     sessions: RoleSessions | None = None,
+    deadline: Deadline | None = None,
 ) -> Outcome:
     """An extra lens (security, DRY) over the current `pr`, checked by its own verifier.
 
@@ -509,6 +560,7 @@ async def review_lens(
         publish=publish,
         limit=max_posted,
         sessions=sessions,
+        deadline=deadline,
     )
     report_as_you_go = max_posted >= MAX_FINDINGS
     combined = "\n\n".join(part for part in (instructions, LENS_RULES if report_as_you_go else FOCUS) if part)
@@ -529,8 +581,13 @@ async def review_lens(
             ),
             on_resume=replay,
         ),
+        label=kind,
+        deadline=deadline,
         report_as_you_go=report_as_you_go,
     )
+    if run is None:
+        logger.warning("%s: cut off before its report, %d posted", kind, len(outcome.posted))
+        return outcome
     logger.info("%s: %d requests, %d posted", kind, run.usage.requests, len(outcome.posted))
     return outcome
 
@@ -548,6 +605,7 @@ async def review(
     checked: Sequence[Finding] = (),
     progress: Progress | None = None,
     publish: Publish | None = None,
+    deadline: Deadline | None = None,
 ) -> Outcome:
     progress = progress or Progress()
     outcome = Outcome(block_at=block_at)
@@ -561,7 +619,9 @@ async def review(
     else:
         history = await sessions.history("correctness", lens) if sessions else None
     progress.set_phase("Continuing the last review" if continuation or history else "Reviewing the change")
-    judge = Judge(pr, verifier, progress, outcome, label="verifier", publish=publish, sessions=sessions)
+    judge = Judge(
+        pr, verifier, progress, outcome, label="verifier", publish=publish, sessions=sessions, deadline=deadline
+    )
     lens_run = await _run_judged(
         judge,
         lambda toolsets, replay: run_role(
@@ -582,7 +642,12 @@ async def review(
             history=history,
             on_resume=replay,
         ),
+        label="reviewer",
+        deadline=deadline,
     )
+    if lens_run is None:
+        logger.warning("review: the lens was cut off before its report; %d posted", len(outcome.posted))
+        return outcome
     report, usage = lens_run.output, lens_run.usage
     outcome.overall_correct, outcome.reviewed = report.overall_correct, report.reviewed
     compacted = compaction_stats(lens_run.all_messages())
