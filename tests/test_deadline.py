@@ -344,7 +344,8 @@ async def test_a_blocking_candidate_unchecked_at_the_cutoff_is_not_posted_and_no
     # Where to look, but not the claim: an unverified finding's text is never posted.
     assert "Not checked before the time limit: `stats.py:5`." in review["body"]
     assert finding(5)["title"] not in review["body"] and github.inline_comments == []
-    # The check run's trail says the same, by location (from the bot's review of #65).
+    # The trail's own note about it gives the location too. (Its earlier "reported:" line, like the lens's
+    # tool call, still shows what was claimed: the trail is the log of the review.)
     assert "not checked in time: stats.py:5" in result.details
     assert f"not checked in time: {finding(5)['title']}" not in result.details
 

@@ -135,21 +135,15 @@ async def before_cutoff[T](deadline: Deadline | None, start: Callable[[], Awaita
         return None
 
 
-class Finishing:
+class Finishing(set[asyncio.Task[object]]):
     """The tasks past their decision, with only its result left to write down (posting a confirmed finding,
     say). `until_cutoff` lets those complete: a post cancelled after it reached GitHub would go unrecorded and
     be posted again with the verdict."""
 
-    def __init__(self) -> None:
-        self._tasks: set[asyncio.Task[object]] = set()
-
     def mark(self) -> None:
         """The calling task has decided. Call this before its first write, with no await in between."""
         if (task := asyncio.current_task()) is not None:
-            self._tasks.add(task)
-
-    def __contains__(self, task: object) -> bool:
-        return task in self._tasks
+            self.add(task)
 
 
 async def until_cutoff[T](
