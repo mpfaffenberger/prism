@@ -34,6 +34,15 @@ def sanitize(text: str, *, limit: int = MAX_TEXT) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def code_span(text: str) -> str:
+    """`text` as an inline code span that nothing inside it can close. A PR's author chooses its file names, so
+    a path may hold backticks or line breaks meant to break out and plant links or mentions in the bot's review."""
+    text = sanitize(" ".join(text.split()), limit=200)
+    fence = "`" * (max(map(len, re.findall("`+", text)), default=0) + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
 _HEADING = "**{rank}{title}** ({kind}{gate})"
 """A finding comment's first line: comment_body writes it, posted_title reads it back."""
 _POSTED_TITLE = re.compile(
@@ -83,7 +92,8 @@ def review_body(outcome: Outcome, *, footer: str) -> str:
     )
     # Where the unchecked candidates are, without their text: an unverified claim is never posted.
     unchecked = (
-        f"Not checked before the time limit: {', '.join(f'`{f.path}:{f.line}`' for f in outcome.unchecked)}.\n\n"
+        f"Not checked before the time limit: {', '.join(code_span(f'{f.path}:{f.line}') for f in outcome.unchecked)}."
+        "\n\n"
         if outcome.unchecked
         else ""
     )
@@ -107,7 +117,8 @@ def review_body(outcome: Outcome, *, footer: str) -> str:
     if outcome.general:
         lines.append("\nOutside the changed lines:")
         lines.extend(
-            f"- `{f.path}:{f.line}`: {comment_body(f, blocking=outcome.is_blocking(f))}" for f in outcome.general
+            f"- {code_span(f'{f.path}:{f.line}')}: {comment_body(f, blocking=outcome.is_blocking(f))}"
+            for f in outcome.general
         )
     lines.append(f"\n{footer}")
     return "\n".join(lines)

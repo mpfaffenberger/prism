@@ -239,7 +239,8 @@ capped at three quarters of the hard deadline so checking keeps its share. With 
 are asked to focus; with one minute left, they lose their tools and must report what they found. Both
 windows shrink for shorter budgets.
 
-The **checking cutoff** comes a minute before the hard deadline. Checking stops waiting there, and the
+The **checking cutoff** leaves one minute for posting, or one tenth of the hard deadline if that is
+shorter. Checking stops waiting there, and the
 verdict is posted from what was judged by then. A lens that still hasn't reported counts as cut short.
 A candidate still unjudged is never posted: from correctness or security it is recorded as unchecked,
 its location (not its text) is listed, and the review can't approve; from an advisory lens, or a

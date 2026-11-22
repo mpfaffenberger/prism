@@ -23,9 +23,9 @@ from autoreviewer.review.diff import (
 )
 from autoreviewer.review.gittools import git_tools
 from autoreviewer.review.job import _summary, finish_check, review_and_post, start_check
-from autoreviewer.review.pipeline import PullRequestText, lens_prompt, review
+from autoreviewer.review.pipeline import OUT_OF_TIME, Outcome, PullRequestText, lens_prompt, review
 from autoreviewer.review.posting import VERDICT_MARKER
-from autoreviewer.review.render import comment_body, sanitize
+from autoreviewer.review.render import code_span, comment_body, review_body, sanitize
 from autoreviewer.review.schemas import Finding
 from autoreviewer.review.workspace import BASE, HEAD, Workspace, read_changes, run_git
 from autoreviewer.web.routing import PullRequestUpdated
@@ -213,6 +213,28 @@ async def test_a_bug_requests_changes_with_an_inline_comment(repo: GitRepo, tmp_
     assert posted["event"] == "REQUEST_CHANGES" and posted["commit_sha"] == repo.head
     assert [(c.path, c.line) for c in github.inline_comments] == [("stats.py", 5)]
     assert (result.conclusion, result.title) == ("failure", "1 blocking issue(s)")
+
+
+@pytest.mark.parametrize(
+    ("name", "span"),
+    [
+        ("stats.py:5", "`stats.py:5`"),
+        ("a`b.py:5", "``a`b.py:5``"),
+        ("`x``y`:5", "``` `x``y`:5 ```"),  # padded on both sides: Markdown strips one space from each
+        ("end`", "`` end` ``"),
+        ("two\nlines.py:5", "`two lines.py:5`"),
+    ],
+)
+def test_a_file_name_cannot_close_its_code_span(name: str, span: str) -> None:
+    """From the bot's review of #65: the PR's author picks the file names the bot's review then prints."""
+    assert code_span(name) == span
+
+
+def test_an_unchecked_candidate_on_a_hostile_file_name_stays_inside_its_span() -> None:
+    hostile = "x`[approve](https://evil.example) @octocat `.py"
+    unchecked = Finding.model_validate({**finding(5, path=hostile), "kind": "correctness"})
+    body = review_body(Outcome(unverified=[(unchecked, OUT_OF_TIME)], cut_short=True), footer="footer")
+    assert f"``{sanitize(hostile)}:5``" in body and "@octocat" not in body  # no ping, and the span holds
 
 
 async def test_a_clean_pr_is_approved(repo: GitRepo, tmp_path: Path) -> None:
