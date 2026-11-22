@@ -144,7 +144,8 @@ async def test_a_review_the_time_limit_cut_off_resolves_nothing_it_did_not_finis
     await Publisher(github, REPO, 7, head_sha="a" * 40, author=BOT, block_at=1)(blocking(5, kind=kind))
     github.review_comments[0]["outdated"] = True  # an earlier head's finding; the push changed the code under it
     stuck, working = FunctionModel(never_answers), verifier_model(lambda f: True)
-    deps = replace(job_deps(github, tmp_path, []), hard_deadline_s=1.0)  # checking stops waiting at 0.9s
+    # Checking stops waiting at 0.9s. With memory, as the bot runs: a cut-short review must not lean on it.
+    deps = replace(job_deps(github, tmp_path, []), hard_deadline_s=1.0, memory=ReviewMemory(tmp_path / "steps"))
     if kind == "correctness":
         deps = replace(deps, agents=lambda ws: (correctness_agent(stuck, ws), verifier_agent(working, ws)))
     else:

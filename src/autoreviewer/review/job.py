@@ -487,7 +487,7 @@ async def review_change(
     # A lens that can block and didn't finish, or whose candidates weren't all judged, never approves.
     outcome.cut_short = timed_out or bool(outcome.failed_blocking) or bool(outcome.cut - ADVISORY_KINDS)
     if deadline is not None:
-        outcome.uncover("correctness" if lens == "reviewer" else lens for lens in deadline.wrapped_up)
+        outcome.uncover("correctness" if label == "reviewer" else label for label in deadline.wrapped_up)
     # A candidate dropped unjudged leaves no trace in `reported`, so its kind can't call anything "fixed".
     outcome.uncover(outcome.cut)
     # A capped lens verifies only its best candidates and drops the rest: at its cap, it may have dropped one.
