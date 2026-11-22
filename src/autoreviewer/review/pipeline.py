@@ -37,9 +37,9 @@ MAX_FINDINGS = 25
 MIN_CONFIDENCE = 4
 """Findings below this confidence (PR-Agent's "a hunch") aren't worth a verifier call."""
 BLOCK_AT_PRIORITY = 1
+"""Confirmed findings at this priority or more urgent (P0, P1) block the merge; the rest are advisory."""
 OUT_OF_TIME = "ran out of time"
 """Why a candidate is unverified when the deadline cut its verification off (Outcome.unchecked)."""
-"""Confirmed findings at this priority or more urgent (P0, P1) block the merge; the rest are advisory."""
 MAX_DESCRIPTION_CHARS = 4000
 MAX_LISTED_FILES = 300
 VERIFY_CONCURRENCY = 3

@@ -39,10 +39,12 @@ def _fence(text: str, *, minimum: int = 1) -> str:
     return "`" * max(minimum, max(map(len, re.findall("`+", text)), default=0) + 1)
 
 
-def code_span(text: str) -> str:
+def code_span(text: str, *, limit: int = MAX_TEXT, suffix: str = "") -> str:
     """`text` as an inline code span that nothing inside it can close. A PR's author chooses its file names, so
-    a path may hold backticks or line breaks meant to break out and plant links or mentions in the bot's review."""
-    text = sanitize(" ".join(text.split()))
+    a path may hold backticks or line breaks meant to break out and plant links or mentions in the bot's review.
+
+    `text` is clipped to `limit`; `suffix` is our own text, added after the clip so it is never cut."""
+    text = sanitize(" ".join(text.split()), limit=limit) + suffix
     fence = _fence(text)
     pad = " " if text.startswith("`") or text.endswith("`") else ""
     return f"{fence}{pad}{text}{pad}{fence}"
@@ -54,7 +56,7 @@ MAX_PATH = 200
 
 def location(path: str, line: int) -> str:
     """Where a finding is, as a code span: `path:line`, with an overlong path clipped before the line number."""
-    return code_span(f"{sanitize(' '.join(path.split()), limit=MAX_PATH)}:{line}")
+    return code_span(path, limit=MAX_PATH, suffix=f":{line}")
 
 
 _HEADING = "**{rank}{title}** ({kind}{gate})"
