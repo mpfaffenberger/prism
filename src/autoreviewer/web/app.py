@@ -249,7 +249,7 @@ def pooled_lens(pool: ModelPool, kind: Literal["correctness"] | LensKind, pinned
         )
 
         def check() -> Agent[None, Verification]:
-            verifier, compact = pool.choose(excluding=model.model_name)
+            verifier, compact = pool.check(model.model_name)
             return checker_agent(kind, verifier, workspace, compact_at=compact)
 
         return finder, check
@@ -292,7 +292,7 @@ def simplifier_agents(plan: ModelPlan) -> SimplifierFactory:
             model, target = plan.overflow_finder or pool.choose()
 
             def check() -> Agent[None, SimplifyVerdict]:
-                verifier, compact = pool.choose(excluding=model.model_name)
+                verifier, compact = pool.check(model.model_name)
                 return simplify_checker_agent(verifier, workspace, compact_at=compact)
 
             return Simplifier(simplify_agent(model, workspace, compact_at=target), check)
@@ -309,7 +309,7 @@ def simplifier_agents(plan: ModelPlan) -> SimplifierFactory:
 def models_note(settings: Settings) -> str:
     """The review footer's "correctness and security by `a`, verified by `b`", one clause per pair of models."""
     if settings.prism and settings.prism.pool:
-        return _pool_note(settings.prism.pool)
+        return _pool_note(settings.prism)
     enabled: list[tuple[AgentKind, str]] = [
         ("correctness", "correctness"),
         *((kind, LENS_NAMES[kind]) for kind in enabled_lenses(settings)),
@@ -322,8 +322,17 @@ def models_note(settings: Settings) -> str:
     )
 
 
-def _pool_note(pool: Mapping[str, int]) -> str:
-    return "scheduled from model pool: " + ", ".join(pool)
+def _pool_note(config: PrismConfig, finder: str | None = None) -> str:
+    """How a pool review's models are named in its footer; `finder` is an overflow finder pinned beside the pool."""
+    pool = ", ".join(config.pool or {})
+    checker = config.checker if config.checks == "checker" and finder != config.checker else None
+    if finder is None:
+        return (
+            f"found by model pool: {pool}; verified by `{checker}`" if checker else f"scheduled from model pool: {pool}"
+        )
+    return f"found by `{finder}`, " + (
+        f"verified by `{checker}`" if checker else f"checks scheduled from model pool: {pool}"
+    )
 
 
 def _and(names: list[str]) -> str:
@@ -377,21 +386,20 @@ def overflow_deps(settings: Settings, normal: ReviewDeps, plan: ModelPlan) -> Re
             f"{OVERFLOW_REPOS} is set but no overflow model is configured: "
             "add `overflow` to prism.json, or `overflow_model` to the deployment profile"
         )
-    if any(plan.models[verifier_role(kind)] == spec for kind in AGENT_KINDS):
+    # A pool places every check on a model other than its finder's (ModelPool.check).
+    if plan.pool is None and any(plan.models[verifier_role(kind)] == spec for kind in AGENT_KINDS):
         raise ValueError(f"{OVERFLOW_REPOS}: overflow checker cannot also be {spec}")
     # A factory or another provider spec can expose the same underlying model.
     active: list[AgentKind] = ["correctness", *enabled_lenses(settings)]
     if settings.simplify:
         active.append("simplify")
     finder = plan.prism.resolve(spec) if plan.prism is not None else resolve_model(spec)
-    # A pool already places every check on a model other than its finder's (ModelPool.choose(excluding=...)).
     for kind in active if plan.pool is None else ():
         if plan.verifier(kind)[0].model_name == finder[0].model_name:
             raise ValueError(f"{OVERFLOW_REPOS}: {kind} checker resolves to the overflow finder")
     models = {**plan.models, **dict.fromkeys(AGENT_KINDS, spec)}
     # Shares the normal plan's resolved checker clients (or its pool, which then places only checks).
     overflow = replace(plan, models=models, overflow_finder=finder)
-    pool = settings.prism.pool if settings.prism else None
     return replace(
         normal,
         agents=correctness_agents(overflow),
@@ -399,7 +407,9 @@ def overflow_deps(settings: Settings, normal: ReviewDeps, plan: ModelPlan) -> Re
         simplifier=simplifier_agents(overflow) if settings.simplify else None,
         lenses=build_lenses(settings, overflow),
         models_note=(
-            f"found by `{spec}`, checks {_pool_note(pool)}" if pool else models_note(replace(settings, models=models))
+            _pool_note(settings.prism, spec)
+            if settings.prism and settings.prism.pool
+            else models_note(replace(settings, models=models))
         ),
         session_namespace="overflow",  # Its own sessions: no local transcript is sent to an overflow finder.
         lens_version=lens_version(spec),

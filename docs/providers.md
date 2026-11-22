@@ -135,6 +135,20 @@ loaded relative to capacity and queues behind its limiter. Each finding gets a p
 when verification begins; the checker cannot have the finder's resolved model name. Each agent
 run stays on its selected model. This is load balancing, not health probing or retry-on-outage.
 
+To keep the pool for finding only and send every check to one dedicated model, add `--checker` and
+`--checks checker` (`"checker"` and `"checks": "checker"` in `prism.json`):
+
+```sh
+uv run prism-config --output prism.json --local-url https://inference.example.com/v1 \
+  --pool-model local:qwen=5 --pool-model local:deepseek=12 \
+  --checker openai-codex:gpt-6.2-sol --checker-lanes 20 --checks checker
+```
+
+Finders still take the first pool model with capacity; checks, thread replies included, go to the checker. A finder
+that is itself the checker's model (an overflow finder on it, say) is checked by the pool instead, so no model
+checks its own findings. Give the checker a concurrency limit with `--checker-lanes` (`lanes` in `prism.json`):
+without one it takes a single request at a time.
+
 Unlike overflow, a pool has no per-repository opt-in: listing a hosted model authorizes review data
 from **every repository this worker reviews**, including private repos, to go there. Omit hosted
 models for a local-only worker. [Overflow](#burst-queued-reviews-to-an-overflow-model) still works
