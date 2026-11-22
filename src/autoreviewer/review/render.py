@@ -42,10 +42,20 @@ def _fence(text: str, *, minimum: int = 1) -> str:
 def code_span(text: str) -> str:
     """`text` as an inline code span that nothing inside it can close. A PR's author chooses its file names, so
     a path may hold backticks or line breaks meant to break out and plant links or mentions in the bot's review."""
-    text = sanitize(" ".join(text.split()), limit=200)
+    text = sanitize(" ".join(text.split()))
     fence = _fence(text)
     pad = " " if text.startswith("`") or text.endswith("`") else ""
     return f"{fence}{pad}{text}{pad}{fence}"
+
+
+MAX_PATH = 200
+"""Characters of a file's path shown in a location; the line number after it is never cut."""
+
+
+def location(path: str, line: int) -> str:
+    """Where a finding is, as a code span: `path:line`, with an overlong path clipped before the line number."""
+    path = " ".join(path.split())
+    return code_span(f"{path if len(path) <= MAX_PATH else path[: MAX_PATH - 1] + '…'}:{line}")
 
 
 _HEADING = "**{rank}{title}** ({kind}{gate})"
@@ -97,8 +107,7 @@ def review_body(outcome: Outcome, *, footer: str) -> str:
     )
     # Where the unchecked candidates are, without their text: an unverified claim is never posted.
     unchecked = (
-        f"Not checked before the time limit: {', '.join(code_span(f'{f.path}:{f.line}') for f in outcome.unchecked)}."
-        "\n\n"
+        f"Not checked before the time limit: {', '.join(location(f.path, f.line) for f in outcome.unchecked)}.\n\n"
         if outcome.unchecked
         else ""
     )
@@ -122,8 +131,7 @@ def review_body(outcome: Outcome, *, footer: str) -> str:
     if outcome.general:
         lines.append("\nOutside the changed lines:")
         lines.extend(
-            f"- {code_span(f'{f.path}:{f.line}')}: {comment_body(f, blocking=outcome.is_blocking(f))}"
-            for f in outcome.general
+            f"- {location(f.path, f.line)}: {comment_body(f, blocking=outcome.is_blocking(f))}" for f in outcome.general
         )
     lines.append(f"\n{footer}")
     return "\n".join(lines)

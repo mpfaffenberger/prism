@@ -119,7 +119,7 @@ async def simplify(
     history = await sessions.history("simplify", simplifier.propose) if sessions else None
     run = await before_cutoff(
         deadline,
-        simplifier.propose.run(
+        lambda: simplifier.propose.run(
             finder_prompt(lens_prompt(replace(pr, reviewable=scoped)), history),
             message_history=history,
             workspace=current_workspace(history),

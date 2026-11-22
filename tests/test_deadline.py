@@ -343,6 +343,9 @@ async def test_a_blocking_candidate_unchecked_at_the_cutoff_is_not_posted_and_no
     # Where to look, but not the claim: an unverified finding's text is never posted.
     assert "Not checked before the time limit: `stats.py:5`." in review["body"]
     assert finding(5)["title"] not in review["body"] and github.inline_comments == []
+    # The check run's trail says the same, by location (from the bot's review of #65).
+    assert "not checked in time: stats.py:5" in result.details
+    assert f"not checked in time: {finding(5)['title']}" not in result.details
 
 
 async def test_what_was_confirmed_before_the_cutoff_still_blocks(repo: GitRepo, tmp_path: Path) -> None:
@@ -410,21 +413,31 @@ async def test_an_advisory_check_unfinished_at_the_cutoff_does_not_withhold_appr
     assert (result.conclusion, result.title) == ("success", "No blocking issues")
     [review] = github.reviews
     assert review["event"] == "APPROVE" and "Not checked" not in review["body"] and github.inline_comments == []
+    assert "1 dry candidate(s) not checked in time: dropped" in result.details  # counted, not described
 
 
-async def test_a_recovered_job_past_the_cutoff_posts_a_partial_verdict_at_once(repo: GitRepo, tmp_path: Path) -> None:
-    """With less left than posting needs, it doesn't wait for a lens: a partial verdict now, not a hard stop
-    later with none."""
+async def test_a_recovered_job_past_the_cutoff_starts_no_lens_and_does_not_approve(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """From the bot's review of #65: with less left than posting needs, no model is called. This lens would
+    answer at once with a clean report, which must not become an approval of a change nobody had time to read."""
+    asked: list[int] = []
+
+    def clean_at_once(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        asked.append(len(messages))
+        report = {"findings": [], "overall_correct": True, "reviewed": ["stats.py"]}
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, report)])
+
     github = FakeGitHub(repo)
     deps = replace(
         job_deps(github, tmp_path),
         agents=lambda ws: (
-            correctness_agent(FunctionModel(never_answers), ws),
+            correctness_agent(FunctionModel(clean_at_once), ws),
             verifier_agent(verifier_model(lambda f: True), ws),
         ),
     )
-    async with asyncio.timeout(5):
-        result = await review_and_post(deps, pull(repo), remaining_s=POSTING_RESERVE_S / 2)
+    result = await review_and_post(deps, pull(repo), remaining_s=POSTING_RESERVE_S / 2)
+    assert asked == []
     assert (result.conclusion, result.title) == ("neutral", "Partially reviewed")
     assert [r["event"] for r in github.reviews] == ["COMMENT"] and github.inline_comments == []
 
@@ -450,12 +463,16 @@ async def test_work_is_cancelled_at_the_cutoff_and_only_then() -> None:
     async def times_out_itself() -> str:
         raise TimeoutError("the model server's own timeout")
 
-    passed = Deadline(soft_s=60, checking_s=0)
-    assert await before_cutoff(passed, forever()) is None and cancelled.is_set()
-    assert await before_cutoff(Deadline(soft_s=60, checking_s=60), quick()) == "done"
-    assert await before_cutoff(None, quick()) == "done" and await before_cutoff(Deadline(soft_s=60), quick()) == "done"
+    assert await before_cutoff(Deadline(soft_s=60, checking_s=0.05), forever) is None and cancelled.is_set()
+    assert await before_cutoff(Deadline(soft_s=60, checking_s=60), quick) == "done"
+    assert await before_cutoff(None, quick) == "done" and await before_cutoff(Deadline(soft_s=60), quick) == "done"
     with pytest.raises(TimeoutError, match="own timeout"):  # not mistaken for the cutoff
-        await before_cutoff(Deadline(soft_s=60, checking_s=60), times_out_itself())
+        await before_cutoff(Deadline(soft_s=60, checking_s=60), times_out_itself)
+
+    # Past the cutoff the work is not begun at all: even work that would finish at once returns nothing.
+    passed, begun = Deadline(soft_s=60, checking_s=0), Mock(side_effect=quick)
+    assert await before_cutoff(passed, begun) is None
+    begun.assert_not_called()
 
     tasks = [asyncio.create_task(quick()), asyncio.create_task(forever())]
     assert await until_cutoff(Deadline(soft_s=60, checking_s=0.05), tasks) == [tasks[1]] and tasks[1].cancelled()

@@ -25,7 +25,7 @@ from autoreviewer.review.gittools import git_tools
 from autoreviewer.review.job import _summary, finish_check, review_and_post, start_check
 from autoreviewer.review.pipeline import OUT_OF_TIME, Outcome, PullRequestText, lens_prompt, review
 from autoreviewer.review.posting import VERDICT_MARKER
-from autoreviewer.review.render import code_span, comment_body, review_body, sanitize
+from autoreviewer.review.render import MAX_PATH, code_span, comment_body, location, review_body, sanitize
 from autoreviewer.review.schemas import Finding
 from autoreviewer.review.workspace import BASE, HEAD, Workspace, read_changes, run_git
 from autoreviewer.web.routing import PullRequestUpdated
@@ -228,6 +228,12 @@ async def test_a_bug_requests_changes_with_an_inline_comment(repo: GitRepo, tmp_
 def test_a_file_name_cannot_close_its_code_span(name: str, span: str) -> None:
     """From the bot's review of #65: the PR's author picks the file names the bot's review then prints."""
     assert code_span(name) == span
+
+
+def test_a_long_path_is_clipped_before_its_line_number() -> None:
+    """From the bot's review of #65: clipping the whole location lost the line."""
+    assert location("stats.py", 5) == "`stats.py:5`"
+    assert location("d/" * 300 + "stats.py", 5) == f"`{('d/' * 300)[: MAX_PATH - 1]}…:5`"
 
 
 def test_an_unchecked_candidate_on_a_hostile_file_name_stays_inside_its_span() -> None:

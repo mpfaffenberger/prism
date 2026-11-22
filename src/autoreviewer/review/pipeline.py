@@ -425,15 +425,22 @@ class Judge:
             self.submit(finding)
         if pending := [task for task in self._tasks if not task.done()]:
             self._progress.set_phase(f"Verifying {len(pending)} candidate finding(s)")
-        for task in await until_cutoff(self._deadline, self._tasks):
-            finding = self._tasks[task]
-            key = (finding.path, finding.line)
-            if key in self._judged or self._latest.get(key) is not finding:
-                continue  # its verdict was in (cut off while posting), or a more urgent report replaced it
-            self._outcome.cut.add(self._kind)
-            self._progress.note(f"not checked in time: {finding.title}")
-            if self._kind not in ADVISORY_KINDS:
-                self._outcome.unverified.append((finding, OUT_OF_TIME))
+        unjudged = [
+            finding
+            for finding in map(self._tasks.__getitem__, await until_cutoff(self._deadline, self._tasks))
+            # Not one whose verdict was in (cut off while posting), nor one a more urgent report replaced.
+            if (key := (finding.path, finding.line)) not in self._judged and self._latest.get(key) is finding
+        ]
+        if not unjudged:
+            return
+        self._outcome.cut.add(self._kind)
+        # Where and how many, never the claim: the progress trail is published to the check run.
+        if self._kind in ADVISORY_KINDS:
+            self._progress.note(f"{len(unjudged)} {self._kind} candidate(s) not checked in time: dropped")
+            return
+        for finding in unjudged:
+            self._progress.note(f"not checked in time: {finding.path}:{finding.line}")
+            self._outcome.unverified.append((finding, OUT_OF_TIME))
 
     def cancel(self) -> None:
         for task in self._tasks:
@@ -483,7 +490,7 @@ async def _run_judged(
     None if the checking cutoff arrived before the lens reported. What it reported along the way is still
     judged, and `label` joins the lenses that were cut off, since it never said what it covered."""
     try:
-        result = await before_cutoff(deadline, run([judge.toolset()] if report_as_you_go else []))
+        result = await before_cutoff(deadline, lambda: run([judge.toolset()] if report_as_you_go else []))
         if result is None:
             assert deadline is not None  # only its cutoff makes before_cutoff give None
             deadline.wrapped_up.add(label)

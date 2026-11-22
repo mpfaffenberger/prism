@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Collection
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 
 from pydantic_ai import RunContext
@@ -27,9 +27,7 @@ from pydantic_ai.tools import ToolDefinition
 MAX_REVIEW_S = 1200.0
 """No review attempt runs longer than this, whatever a deployment configures: the one definition of the cap."""
 DEFAULT_SOFT_S = 900.0
-"""The default soft budget: a quarter of the cap stays for checking what the lenses found. At 9 of 10 minutes
-(Nov 21 2026) a lens's last report landed seconds before the hard stop, and 7 of 9 live reviews ended with no
-verdict. The countdown below is sized for this budget."""
+"""The default soft budget leaves a quarter of the cap for checking and sets the scale for the countdown."""
 POSTING_RESERVE_S = 60.0
 """Kept between the checking cutoff and the hard stop, for reading the PR's state and posting the verdict."""
 FOCUS_S = 300
@@ -116,12 +114,17 @@ def checking_cutoff(hard_s: float) -> float:
     return hard_s - min(POSTING_RESERVE_S, hard_s / 10)
 
 
-async def before_cutoff[T](deadline: Deadline | None, work: Awaitable[T]) -> T | None:
-    """`work`'s result, or None if the checking cutoff arrives first (`work` is then cancelled)."""
-    cutoff = asyncio.timeout(deadline.checking_remaining if deadline else None)  # None never expires
+async def before_cutoff[T](deadline: Deadline | None, start: Callable[[], Awaitable[T]]) -> T | None:
+    """The result of the work `start` begins, or None if the checking cutoff comes first. Work under way is
+    cancelled then, and work not yet begun is never started: a timeout of zero would still let it run to its
+    first suspension, far enough to send a model request or even to finish."""
+    remaining = deadline.checking_remaining if deadline else None
+    if remaining is not None and remaining <= 0:
+        return None
+    cutoff = asyncio.timeout(remaining)  # None never expires
     try:
         async with cutoff:
-            return await work
+            return await start()
     except TimeoutError:
         if not cutoff.expired():  # the work's own timeout, not the cutoff
             raise

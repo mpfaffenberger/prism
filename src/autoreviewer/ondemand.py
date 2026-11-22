@@ -27,7 +27,7 @@ from autoreviewer.github import PublicGitHub, PullRequestReader, Repo
 from autoreviewer.review.deadline import Deadline, checking_cutoff
 from autoreviewer.review.job import AgentFactory, CheckResult, Lens, Reviewed, review_change
 from autoreviewer.review.pipeline import BLOCK_AT_PRIORITY, Outcome
-from autoreviewer.review.render import comment_body
+from autoreviewer.review.render import comment_body, location
 from autoreviewer.review.simplify import SimplifierFactory
 from autoreviewer.review.workspace import PublicSource, RepoSource
 
@@ -83,7 +83,7 @@ class Report:
             lines.append(f"## `{finding.path}:{finding.line}`\n\n{body}\n")
         if unchecked := outcome.unchecked:
             lines.append(f"**{len(unchecked)} candidate(s) were not checked before the time limit** (never posted):\n")
-            lines.extend(f"- `{f.path}:{f.line}` {f.title}" for f in unchecked)
+            lines.extend(f"- {location(f.path, f.line)} {f.title}" for f in unchecked)
             lines.append("")
         if failed := outcome.verifier_failed:
             lines.append(f"**{len(failed)} candidate(s) could not be verified** (the verifier failed):\n")
