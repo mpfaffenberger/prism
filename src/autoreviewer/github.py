@@ -146,6 +146,13 @@ class Commands(PullRequestReader, Protocol):
     async def react(self, repo: Repo, comment_id: int, content: Reaction) -> None: ...
 
 
+async def adds_to(reader: PullRequestReader, repo: Repo, older: str, newer: str) -> bool:
+    """Whether `newer` adds commits on top of `older`, so `older` is a strict ancestor of it (GitHub's compare
+    says "ahead"). The one place the order of `compare`'s arguments is spelled. Raises as `compare` does;
+    each caller decides what doubt means for it."""
+    return (await reader.compare(repo, older, newer)).status == "ahead"
+
+
 class PullRequests(PullRequestReader, Protocol):
     """Everything the bot's review job needs: reading, plus check runs and posting reviews."""
 

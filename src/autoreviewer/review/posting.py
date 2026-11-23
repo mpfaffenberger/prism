@@ -26,6 +26,7 @@ from autoreviewer.github import (
     ReviewRejected,
     ReviewState,
     ReviewThread,
+    adds_to,
 )
 from autoreviewer.review.deadline import Deadline
 from autoreviewer.review.pipeline import Outcome, Withdrawal, blocks, blocks_at, normal_title, same_defect
@@ -448,7 +449,7 @@ async def _outdated_before(github: Conversations, repo: Repo, comment: PostedCom
     if comment.applies_at is None:
         return False
     try:
-        return (await github.compare(repo, comment.applies_at, commit)).status == "ahead"
+        return await adds_to(github, repo, comment.applies_at, commit)
     except CommitNotFound:  # rewritten history: can't tell, so it still counts
         return False
 

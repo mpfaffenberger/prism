@@ -6,13 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from autoreviewer.github import PostedComment, Repo
+from autoreviewer.github import PostedComment, Repo, ReviewComment
 from autoreviewer.review.job import review_and_post
 from autoreviewer.review.pipeline import Outcome, normal_title
 from autoreviewer.review.posting import (
     STALE_REQUEST,
     Publisher,
     answer_markers,
+    fingerprint,
     post_review,
     reconsider,
     retire_stale_request,
@@ -21,7 +22,7 @@ from autoreviewer.review.posting import (
 from autoreviewer.review.render import comment_body, posted_title
 from autoreviewer.review.schemas import Finding
 from autoreviewer.web.routing import PullRequestUpdated
-from tests.review_fakes import BOT, FakeGitHub, GitRepo, finding, job_deps
+from tests.review_fakes import BOT, FakeGitHub, GitRepo, add_commit, finding, job_deps
 
 pytestmark = pytest.mark.anyio
 
@@ -277,6 +278,8 @@ async def test_a_withdrawal_after_a_push_dismisses_the_stale_request_without_app
         ("an earlier commit", True),  # outdated before the request, whose complete review judged it
         ("a commit GitHub forgot", False),  # rewritten history: can't tell, so it still counts
         ("no commit on record", False),
+        ("a commit rewritten away", False),  # diverged after a force-push: not before the request
+        ("a later commit", False),  # still applied after the request
     ],
 )
 async def test_an_outdated_blocker_holds_the_request_unless_it_was_outdated_before_it(
@@ -286,12 +289,15 @@ async def test_an_outdated_blocker_holds_the_request_unless_it_was_outdated_befo
     complete review checks it, and a thread marked settled, by whoever, doesn't stand in for that."""
     github = await pushed_then_withdrawn(repo, blocking(5), blocking(9))
     github.review_comments[1]["outdated"] = True
-    github.review_comments[1]["applied_until"] = {
-        "the request's commit": repo.head,
-        "an earlier commit": repo.base,
-        "a commit GitHub forgot": "e" * 40,
-        "no commit on record": None,
-    }[applied_until]
+    commits = {
+        "the request's commit": lambda: repo.head,
+        "an earlier commit": lambda: repo.base,
+        "a commit GitHub forgot": lambda: "e" * 40,
+        "no commit on record": lambda: None,
+        "a commit rewritten away": lambda: add_commit(repo, {"stats.py": "rewritten\n"}, branch_from=repo.base),
+        "a later commit": lambda: add_commit(repo, {"stats.py": "later\n"}),
+    }
+    github.review_comments[1]["applied_until"] = commits[applied_until]()
     github.settled_threads.add("T2")  # as a later, partial review's settle_fixed would
     assert await retire(github) is dismissed
 
@@ -302,6 +308,7 @@ async def test_an_outdated_blocker_holds_the_request_unless_it_was_outdated_befo
         "the request is on the head",
         "another blocker stands",
         "a later review's blocker stands",
+        "a blocker from before kinds were recorded stands",
         "a blocker has no thread",
         "the review was partial",
         "the pr is closed",
@@ -313,6 +320,10 @@ async def test_a_stale_request_stays_unless_nothing_it_stood_on_is_left(repo: Gi
     github = await pushed_then_withdrawn(repo, *findings, cut_short=why == "the review was partial")
     if why == "a later review's blocker stands":  # posted on the new head by a review that didn't finish
         await Publisher(github, REPO, 7, head_sha=NEXT, author=BOT, block_at=1)(blocking(12))
+    if why == "a blocker from before kinds were recorded stands":  # its marker names no kind, so it may block
+        marker = f"<!-- autoreviewer:{fingerprint(repo.head, blocking(12))} p1 -->"
+        legacy = ReviewComment("stats.py", 12, f"**[P1] Old finding** (correctness)\n\n{marker}")
+        github.review_comments.append({"commit_sha": repo.head, "comment": legacy, "author": BOT})
     if why == "a blocker has no thread":  # outside=1: nothing could withdraw that one
         github.reviews[-1]["body"] = github.reviews[-1]["body"].replace("outside=0", "outside=1")
     if why == "the request is on the head":

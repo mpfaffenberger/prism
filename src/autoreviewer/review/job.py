@@ -27,6 +27,7 @@ from autoreviewer.github import (
     PullRequestState,
     Repo,
     ReviewEvent,
+    adds_to,
 )
 from autoreviewer.review.checkpoints import TurnCheckpoints
 from autoreviewer.review.deadline import DEFAULT_SOFT_S, MAX_REVIEW_S, Deadline, checking_cutoff
@@ -377,7 +378,7 @@ async def review_change(
         async with ancestry_lock:
             if previous not in comparisons:
                 try:
-                    comparisons[previous] = (await reader.compare(repo, previous, head_sha)).status == "ahead"
+                    comparisons[previous] = await adds_to(reader, repo, previous, head_sha)
                 except Exception:
                     logger.warning("cannot verify history ancestry for %s; starting fresh", conversation)
                     comparisons[previous] = False
@@ -546,11 +547,10 @@ async def _resumable(
     if prior.version != version or prior.base_sha != base or prior.head_sha == head_sha:
         return None  # another prompt/model, a moved merge-base, or the same head again: start fresh
     try:
-        comparison = await reader.compare(repo, prior.head_sha, head_sha)
+        if not await adds_to(reader, repo, prior.head_sha, head_sha):
+            return None  # force-push, rebase, or reset: the old conversation describes code that's gone
     except CommitNotFound:
         return None  # the reviewed head is gone (force-pushed away, then garbage-collected)
-    if comparison.status != "ahead":
-        return None  # force-push, rebase, or reset: the old conversation describes code that's gone
     return prior
 
 
