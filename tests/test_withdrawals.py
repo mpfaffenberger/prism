@@ -6,14 +6,23 @@ from pathlib import Path
 
 import pytest
 
-from autoreviewer.github import PostedComment, Repo
+from autoreviewer.github import PostedComment, Repo, ReviewComment
 from autoreviewer.review.job import review_and_post
 from autoreviewer.review.pipeline import Outcome, normal_title
-from autoreviewer.review.posting import Publisher, answer_markers, post_review, reconsider, withdrawals
+from autoreviewer.review.posting import (
+    STALE_REQUEST,
+    Publisher,
+    answer_markers,
+    fingerprint,
+    post_review,
+    reconsider,
+    retire_stale_request,
+    withdrawals,
+)
 from autoreviewer.review.render import comment_body, posted_title
 from autoreviewer.review.schemas import Finding
 from autoreviewer.web.routing import PullRequestUpdated
-from tests.review_fakes import BOT, FakeGitHub, GitRepo, finding, job_deps
+from tests.review_fakes import BOT, FakeGitHub, GitRepo, add_commit, finding, job_deps
 
 pytestmark = pytest.mark.anyio
 
@@ -131,6 +140,15 @@ async def test_approves_once_nothing_blocking_is_left_standing(repo: GitRepo) ->
     assert not await reconsider(github, REPO, 7, author=BOT, block_at=1)  # already approved: a replay is a no-op
 
 
+async def test_a_blocker_outdated_on_the_head_does_not_hold_back_its_approval(repo: GitRepo) -> None:
+    """From #68's refactor of standing_blockers: GitHub shows the second finding as outdated, so it was about older
+    code, and the head's review in full didn't find it again. Only the head's own blocker, withdrawn, counted."""
+    github = await reviewed(repo, blocking(5), blocking(9))
+    withdraw(github, 1)
+    github.review_comments[1]["outdated"] = True
+    assert await reconsider(github, REPO, 7, author=BOT, block_at=1)
+
+
 async def test_a_new_partial_review_prevents_approval_from_an_older_verdict(repo: GitRepo) -> None:
     github = await reviewed(repo, blocking(5))
     await post_review(
@@ -224,3 +242,122 @@ def test_a_posted_title_reads_back_as_written(title: str) -> None:
     root = PostedComment("stats.py", 5, f"{body}\n\n<!-- autoreviewer:{'0' * 16} p1 correctness -->", 1)
     answer = PostedComment("stats.py", 5, f"ok\n\n{answer_markers(9, withdrawn=True)}", 2, 1)
     assert [w.title for w in withdrawals([root, answer])] == [normal_title(title)]
+
+
+NEXT = "b" * 40
+"""A commit pushed after the review: the PR's head when the bot withdraws (#68)."""
+
+
+async def retire(github: FakeGitHub, *, block_at: int = 1) -> bool:
+    return await retire_stale_request(github, REPO, 7, author=BOT, block_at=block_at)
+
+
+async def pushed_then_withdrawn(repo: GitRepo, *findings: Finding, cut_short: bool = False) -> FakeGitHub:
+    """Reviewed with `findings`, the author pushes again, and the bot withdraws the first finding (comment 1)."""
+    github = await reviewed(repo, *findings, cut_short=cut_short)
+    github.head_shas = [NEXT]
+    withdraw(github, 1)
+    return github
+
+
+async def test_a_withdrawal_after_a_push_dismisses_the_stale_request_without_approving(repo: GitRepo) -> None:
+    """#68: the head has no verdict yet, so reconsider can't approve it, and the request stayed in force."""
+    github = await pushed_then_withdrawn(repo, blocking(5), blocking(9, kind="dry"))  # DRY never blocks
+    assert not await reconsider(github, REPO, 7, author=BOT, block_at=1)
+    assert await retire(github)
+    [request] = github.reviews
+    assert request["dismissed"] == STALE_REQUEST and "not an approval" in STALE_REQUEST
+    assert github.checks == []  # the head's own check decides; no green check from a review that never ran
+    assert not await retire(github)  # a replay finds it dismissed and does nothing
+
+
+@pytest.mark.parametrize(
+    ("applied_until", "dismissed"),
+    [
+        ("the request's commit", False),  # the request stood on it; the code moved past it only later
+        ("an earlier commit", True),  # outdated before the request, whose complete review judged it
+        ("a commit GitHub forgot", False),  # rewritten history: can't tell, so it still counts
+        ("no commit on record", False),
+        ("a commit rewritten away", False),  # diverged after a force-push: not before the request
+        ("a later commit", False),  # still applied after the request
+    ],
+)
+async def test_an_outdated_blocker_holds_the_request_unless_it_was_outdated_before_it(
+    repo: GitRepo, applied_until: str, dismissed: bool
+) -> None:
+    """From the bot's review of #73: the code moving past a blocker after the request proves nothing until a
+    complete review checks it, and a thread marked settled, by whoever, doesn't stand in for that."""
+    github = await pushed_then_withdrawn(repo, blocking(5), blocking(9))
+    github.review_comments[1]["outdated"] = True
+    commits = {
+        "the request's commit": lambda: repo.head,
+        "an earlier commit": lambda: repo.base,
+        "a commit GitHub forgot": lambda: "e" * 40,
+        "no commit on record": lambda: None,
+        "a commit rewritten away": lambda: add_commit(repo, {"stats.py": "rewritten\n"}, branch_from=repo.base),
+        "a later commit": lambda: add_commit(repo, {"stats.py": "later\n"}),
+    }
+    github.review_comments[1]["applied_until"] = commits[applied_until]()
+    github.settled_threads.add("T2")  # as a later, partial review's settle_fixed would
+    assert await retire(github) is dismissed
+
+
+@pytest.mark.parametrize(
+    "why",
+    [
+        "the request is on the head",
+        "another blocker stands",
+        "a later review's blocker stands",
+        "a blocker from before kinds were recorded stands",
+        "a blocker has no thread",
+        "the review was partial",
+        "the pr is closed",
+        "an approval is in force",
+    ],
+)
+async def test_a_stale_request_stays_unless_nothing_it_stood_on_is_left(repo: GitRepo, why: str) -> None:
+    findings = (blocking(5), blocking(9)) if why == "another blocker stands" else (blocking(5),)
+    github = await pushed_then_withdrawn(repo, *findings, cut_short=why == "the review was partial")
+    if why == "a later review's blocker stands":  # posted on the new head by a review that didn't finish
+        await Publisher(github, REPO, 7, head_sha=NEXT, author=BOT, block_at=1)(blocking(12))
+    if why == "a blocker from before kinds were recorded stands":  # its marker names no kind, so it may block
+        marker = f"<!-- autoreviewer:{fingerprint(repo.head, blocking(12))} p1 -->"
+        legacy = ReviewComment("stats.py", 12, f"**[P1] Old finding** (correctness)\n\n{marker}")
+        github.review_comments.append({"commit_sha": repo.head, "comment": legacy, "author": BOT})
+    if why == "a blocker has no thread":  # outside=1: nothing could withdraw that one
+        github.reviews[-1]["body"] = github.reviews[-1]["body"].replace("outside=0", "outside=1")
+    if why == "the request is on the head":
+        github.head_shas = [repo.head]  # reconsider's case: it approves instead
+    if why == "the pr is closed":
+        github.pr_state = "closed"
+    if why == "an approval is in force":
+        github.reviews.append({**github.reviews[-1], "event": "APPROVE", "commit_sha": NEXT})
+    assert not await retire(github)
+    assert all("dismissed" not in review for review in github.reviews)
+
+
+async def test_a_later_partial_verdict_leaves_the_request_in_force_and_still_retirable(repo: GitRepo) -> None:
+    """From the bot's review of #73: the newer commit's review was cut short, so its verdict only comments (#68's
+    own case). GitHub keeps the older request in force, and it is that request the bot dismisses."""
+    github = await pushed_then_withdrawn(repo, blocking(5))
+    await post_review(github, REPO, 7, head_sha=NEXT, author=BOT, models_note="m", outcome=Outcome(cut_short=True))
+    assert github.reviews[-1]["event"] == "COMMENT"
+    assert await retire(github)
+    assert "dismissed" in github.reviews[0] and "dismissed" not in github.reviews[-1]
+
+
+@pytest.mark.parametrize(("block_at", "dismissed"), [(1, True), (2, False)])
+async def test_only_findings_at_the_bots_threshold_hold_a_stale_request(
+    repo: GitRepo, block_at: int, dismissed: bool
+) -> None:
+    """From the bot's review of #73: a P2 finding left standing is advice at block_at=1 and a blocker at 2."""
+    github = await pushed_then_withdrawn(repo, blocking(5), blocking(9, priority=2))
+    assert await retire(github, block_at=block_at) is dismissed
+
+
+async def test_a_dismissal_github_refuses_leaves_the_pr_as_it_was(repo: GitRepo) -> None:
+    """A protected branch may limit who can dismiss: that is no reason to fail the answer that came before."""
+    github = await pushed_then_withdrawn(repo, blocking(5))
+    github.fail_dismissals = True
+    assert not await retire(github)
+    assert "dismissed" not in github.reviews[0]

@@ -16,13 +16,17 @@ from dataclasses import replace
 from typing import cast
 
 from autoreviewer.github import (
+    CommitNotFound,
+    Conversations,
     PostedComment,
     PullRequests,
     Repo,
     ReviewComment,
     ReviewEvent,
     ReviewRejected,
+    ReviewState,
     ReviewThread,
+    adds_to,
 )
 from autoreviewer.review.deadline import Deadline
 from autoreviewer.review.pipeline import Outcome, Withdrawal, blocks, blocks_at, normal_title, same_defect
@@ -76,6 +80,12 @@ event, how many blocking findings it listed with no thread to withdraw them in, 
 the whole change. A withdrawal only ever overturns a complete verdict that requested changes with outside=0."""
 
 
+def overturnable(verdict: re.Match[str] | None) -> bool:
+    """Whether a withdrawal may overturn this verdict state: a complete review that requested changes, with every
+    blocking finding in a thread a withdrawal could happen in (outside=0)."""
+    return verdict is not None and verdict.group(1, 2, 3) == ("REQUEST_CHANGES", "0", "1")
+
+
 Placement = tuple[str, int, str]
 """(path, line on the current head, kind): where GitHub shows a finding comment."""
 
@@ -110,6 +120,18 @@ def withdrawals(comments: Iterable[PostedComment]) -> tuple[Withdrawal, ...]:
     return tuple(found)
 
 
+def blocking_findings(comments: Iterable[PostedComment], block_at: int) -> list[tuple[PostedComment, re.Match[str]]]:
+    """The bot's finding comments that block a merge, wherever GitHub shows them (outdated too), each with its
+    marker. Withdrawn ones included: the caller decides what clears one."""
+    return [
+        (comment, match)
+        for comment in comments
+        if comment.in_reply_to is None
+        and (match := finding_marker(comment.body))
+        and blocks_at(match[3], int(match[2]), block_at)
+    ]
+
+
 def standing_blockers(comments: Iterable[PostedComment], block_at: int) -> list[tuple[PostedComment, re.Match[str]]]:
     """The bot's blocking finding comments GitHub still shows on the current head that their thread hasn't
     withdrawn, each with its marker."""
@@ -117,12 +139,8 @@ def standing_blockers(comments: Iterable[PostedComment], block_at: int) -> list[
     withdrawn = withdrawn_threads(comments)
     return [
         (comment, match)
-        for comment in comments
-        if comment.in_reply_to is None
-        and comment.line is not None
-        and comment.id not in withdrawn
-        and (match := finding_marker(comment.body))
-        and blocks_at(match[3], int(match[2]), block_at)
+        for comment, match in blocking_findings(comments, block_at)
+        if comment.line is not None and comment.id not in withdrawn
     ]
 
 
@@ -359,8 +377,8 @@ async def reconsider(github: PullRequests, repo: Repo, number: int, *, author: s
     if state.state != "open":
         return False
     bodies = await github.review_bodies(repo, number, commit_sha=state.head_sha, author=author)
-    verdicts = [match.group(1, 2, 3) for body in bodies if (match := _VERDICT_STATE.search(body))]
-    if not verdicts or verdicts[-1] != ("REQUEST_CHANGES", "0", "1"):
+    verdicts = [match for body in bodies if (match := _VERDICT_STATE.search(body))]
+    if not verdicts or not overturnable(verdicts[-1]):
         return False
     if standing_blockers(await github.posted_comments(repo, number, author=author), block_at):
         return False
@@ -374,6 +392,66 @@ async def reconsider(github: PullRequests, repo: Repo, number: int, *, author: s
     await github.create_review(repo, number, commit_sha=state.head_sha, event="APPROVE", body=body, comments=[])
     logger.info("%s/%s#%d at %s: approved after withdrawals", repo.owner, repo.name, number, state.head_sha[:7])
     return True
+
+
+DECISIVE: frozenset[ReviewState] = frozenset({"APPROVED", "CHANGES_REQUESTED", "DISMISSED"})
+"""The review states that set a reviewer's decision on GitHub: its latest such review is the one in force."""
+STALE_REQUEST = (
+    "Every blocking finding of this review was withdrawn in its thread after a re-check of the code. "
+    "This is not an approval: the newer commit gets its own review."
+)
+
+
+async def retire_stale_request(github: Conversations, repo: Repo, number: int, *, author: str, block_at: int) -> bool:
+    """After a withdrawal, once the PR has moved past the commit the bot requested changes on: dismiss that review
+    if every blocking finding it could have stood on, and any posted since, is withdrawn in its thread.
+    `reconsider` handles a request on the head itself, by approving.
+
+    Without this the request stays in force until a later review posts a verdict, and one that times out never
+    does (#68). Only a complete verdict with no blocker outside a thread qualifies, as for `reconsider`. A
+    complete verdict judged every comment GitHub still showed on its commit, so only comments outdated before that
+    commit are past it (`_outdated_before`). Nothing else clears a blocker: not the code moving past it later (no
+    complete review has checked that, or its verdict would be the one in force), and not a thread marked settled
+    or resolved, which a later partial review, a moderator or a maintainer can do.
+
+    Never an approval: the bot hasn't reviewed the head, and the head's check still decides. True if it
+    dismissed. Decided by code, never by the model; a replay finds the review dismissed and does nothing."""
+    state = await github.get_pull(repo, number)
+    if state.state != "open":
+        return False
+    decisive = [
+        review for review in await github.posted_reviews(repo, number, author=author) if review.state in DECISIVE
+    ]
+    if not decisive or (review := decisive[-1]).state != "CHANGES_REQUESTED" or review.commit_sha == state.head_sha:
+        return False
+    if not overturnable(_VERDICT_STATE.search(review.body)):
+        return False
+    comments = await github.posted_comments(repo, number, author=author)
+    withdrawn = withdrawn_threads(comments)
+    for comment, _ in blocking_findings(comments, block_at):
+        if comment.id not in withdrawn and not await _outdated_before(github, repo, comment, review.commit_sha):
+            return False
+    try:
+        await github.dismiss_review(repo, number, review.id, message=STALE_REQUEST)
+    except Exception:  # e.g. a protected branch that limits who may dismiss: the PR is just left as it was
+        logger.warning(
+            "could not dismiss review %d on %s/%s#%d", review.id, repo.owner, repo.name, number, exc_info=True
+        )
+        return False
+    logger.info("%s/%s#%d: dismissed review %d at %s after withdrawals", repo.owner, repo.name, number, review.id,
+                review.commit_sha[:7])  # fmt: skip
+    return True
+
+
+async def _outdated_before(github: Conversations, repo: Repo, comment: PostedComment, commit: str) -> bool:
+    """Whether GitHub stopped showing `comment` on the code before `commit`: the last commit it applied to is a
+    strict ancestor of it. False when unsure (no record of that commit, or one GitHub no longer knows)."""
+    if comment.applies_at is None:
+        return False
+    try:
+        return await adds_to(github, repo, comment.applies_at, commit)
+    except CommitNotFound:  # rewritten history: can't tell, so it still counts
+        return False
 
 
 async def settle_fixed(
