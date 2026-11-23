@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 import httpx2
 import jwt
@@ -24,9 +24,11 @@ from autoreviewer.github import (
     Comparison,
     GitHubApp,
     PostedComment,
+    PostedReview,
     Repo,
     ReviewComment,
     ReviewRejected,
+    ReviewState,
     ReviewThread,
     ThreadComment,
 )
@@ -99,10 +101,12 @@ class FakeGitHub:
             return httpx2.Response(200, json={"id": 99, "name": CHECK_NAME})
         if method == "GET" and path == f"{base}/pulls/7/reviews":
             return httpx2.Response(200, json=[
-                {"user": {"login": BOT_LOGIN}, "commit_id": HEAD, "body": "verdict"},
-                {"user": {"login": BOT_LOGIN}, "commit_id": HEAD, "body": None},  # wraps a single comment
-                {"user": {"login": BOT_LOGIN}, "commit_id": "d" * 40, "body": "older head"},
-                {"user": {"login": "someone"}, "commit_id": HEAD, "body": "human"},
+                {"id": 31, "user": {"login": BOT_LOGIN}, "commit_id": HEAD, "state": "CHANGES_REQUESTED",
+                 "body": "verdict"},
+                {"user": {"login": BOT_LOGIN}, "commit_id": HEAD, "body": None},  # wraps a comment; fields missing
+                {"id": 33, "user": {"login": BOT_LOGIN}, "commit_id": "d" * 40, "state": "DISMISSED",
+                 "body": "older head"},
+                {"id": 34, "user": {"login": "someone"}, "commit_id": HEAD, "state": "APPROVED", "body": "human"},
             ])  # fmt: skip
         if method == "GET" and path == f"{base}/pulls/7/comments":
             return httpx2.Response(200, json=[
@@ -125,6 +129,9 @@ class FakeGitHub:
                 )
             self.writes.append(("create_review", path, json.loads(request.content)))
             return httpx2.Response(200, json={"id": 1})
+        if method == "PUT" and path == f"{base}/pulls/7/reviews/31/dismissals":
+            self.writes.append(("dismiss_review", path, json.loads(request.content)))
+            return httpx2.Response(200, json={"id": 31, "state": "DISMISSED"})
         if method == "POST" and path == "/graphql":
             return self._graphql(json.loads(request.content))
         return httpx2.Response(404, json={"message": f"unexpected {method} {path}"})
@@ -255,6 +262,14 @@ async def test_single_comments_and_review_listings(fake_and_app: tuple[FakeGitHu
         "start_side": "RIGHT",
     }
     assert await app.review_bodies(REPO, 7, commit_sha=HEAD, author=BOT_LOGIN) == ["verdict", ""]
+    assert await app.posted_reviews(REPO, 7, author=BOT_LOGIN) == [
+        PostedReview(31, HEAD, "CHANGES_REQUESTED", "verdict"),
+        PostedReview(0, HEAD, cast(ReviewState, ""), ""),
+        PostedReview(33, "d" * 40, "DISMISSED", "older head"),
+    ]
+    await app.dismiss_review(REPO, 7, 31, message="stale")
+    assert fake.writes[-1] == ("dismiss_review", "/repos/mpfaffenberger/demo/pulls/7/reviews/31/dismissals",
+                               {"message": "stale"})  # fmt: skip
     assert await app.posted_comments(REPO, 7, author=BOT_LOGIN) == [
         PostedComment("f1.py", 7, f"finding {MARKER}", 11),
         PostedComment("f2.py", None, "outdated", 12),

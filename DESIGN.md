@@ -355,7 +355,8 @@ Events: `pull_request_review_comment` (thread replies) and `issue_comment`
   the defect is still there. Advice is withdrawn on the answer alone; a linter's findings (types, lint) never
   are. The answer is sanitised, and a withdrawal ends with `<!-- autoreviewer:withdrawn -->`.
 
-**Withdrawals change the verdict, decided by code** (`posting.withdrawn_threads`, `posting.reconsider`).
+**Withdrawals change the verdict, decided by code** (`posting.withdrawn_threads`, `posting.reconsider`,
+`posting.retire_stale_request`).
 
 - A finding stands withdrawn when the latest answer in its own thread withdrew it. Answers end with code-written
   markers (`<!-- autoreviewer:answers <id> -->`, then `<!-- autoreviewer:withdrawn -->` for a withdrawal), and
@@ -365,6 +366,13 @@ Events: `pull_request_review_comment` (thread replies) and `issue_comment`
 - After a withdrawal, a separate durable step reconsiders the head: if its latest verdict requested changes
   after a complete review with outside=0, and no blocking finding comment on the head is left standing (each
   checked against its own thread), the bot posts a green check, then an approval.
+- If the PR has moved past the commit the bot requested changes on (the author pushed before the bot
+  withdrew), there is no head verdict to overturn, and that request would stay in force until a later review
+  posts a verdict (#68). The bot dismisses it instead, on the same conditions for that verdict, provided every
+  blocking finding comment it posted on the PR is withdrawn or settled by the bot. That covers outdated ones
+  too, since lines on an older commit can't be placed on the head. A thread a person resolved doesn't count.
+  The bot dismisses but never approves: it hasn't reviewed the head, and the head's check decides. If GitHub
+  refuses the dismissal (for example, a protected branch that limits who may dismiss), the PR stays as it was.
 - On a later push, a finding found again is unblocked only if it's the withdrawn one: same place, kind, and
   title (normalised), and no more urgent; GitHub must still show the old comment there (unchanged code).
   Anything else blocks as usual.

@@ -23,7 +23,14 @@ from autoreviewer.github import Conversations, ThreadComment
 from autoreviewer.review.agents import CONVERSATION_LIMITS, VERIFIER_LIMITS
 from autoreviewer.review.job import repo_of
 from autoreviewer.review.lint import LINT_KINDS
-from autoreviewer.review.posting import answer_markers, answered, finding_marker, mark_thread, reconsider
+from autoreviewer.review.posting import (
+    answer_markers,
+    answered,
+    finding_marker,
+    mark_thread,
+    reconsider,
+    retire_stale_request,
+)
 from autoreviewer.review.render import sanitize
 from autoreviewer.review.schemas import ADVISORY_KINDS, ThreadAnswer, Verification
 from autoreviewer.review.workspace import RepoSource, Workspace
@@ -137,5 +144,9 @@ def _prompt(title: str, thread: list[ThreadComment], comment_id: int) -> str:
 
 
 async def reconsider_verdict(deps: ConversationDeps, reply: ThreadReply) -> bool:
-    """After a withdrawal: approve the PR's head if nothing blocking is left standing (posting.reconsider)."""
-    return await reconsider(deps.github, repo_of(reply), reply.number, author=deps.bot_login, block_at=deps.block_at)
+    """After a withdrawal: approve the PR's head if nothing blocking is left standing (posting.reconsider), or
+    else dismiss a request for changes on a commit the PR has moved past (posting.retire_stale_request)."""
+    repo, author, block_at = repo_of(reply), deps.bot_login, deps.block_at
+    return await reconsider(deps.github, repo, reply.number, author=author, block_at=block_at) or (
+        await retire_stale_request(deps.github, repo, reply.number, author=author, block_at=block_at)
+    )

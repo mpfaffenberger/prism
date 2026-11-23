@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from githubkit import AppAuthStrategy, GitHub, TokenAuthStrategy, UnauthAuthStrategy
 from githubkit.exception import RequestFailed
@@ -13,6 +13,7 @@ CHECK_NAME = "autoreviewer"
 
 Conclusion = Literal["success", "failure", "neutral"]
 ReviewEvent = Literal["APPROVE", "REQUEST_CHANGES", "COMMENT"]
+ReviewState = Literal["APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"]
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,16 @@ class PostedComment:
     id: int
     in_reply_to: int | None = None
     """The thread's first comment, for a reply; None for a comment that starts a thread."""
+
+
+@dataclass(frozen=True)
+class PostedReview:
+    """A review already on a PR, as GitHub lists it."""
+
+    id: int
+    commit_sha: str
+    state: ReviewState
+    body: str
 
 
 @dataclass(frozen=True)
@@ -178,6 +189,12 @@ class Conversations(PullRequests, Protocol):
     async def thread(self, repo: Repo, number: int, root_id: int) -> list[ThreadComment]:
         """The thread's first comment, then its replies, oldest first."""
         ...
+
+    async def posted_reviews(self, repo: Repo, number: int, *, author: str) -> list[PostedReview]:
+        """`author`'s reviews of the PR, every commit, oldest first."""
+        ...
+
+    async def dismiss_review(self, repo: Repo, number: int, review_id: int, *, message: str) -> None: ...
 
 
 async def _get_pull(github: GitHub, repo: Repo, number: int) -> PullRequestState:
@@ -430,20 +447,32 @@ class GitHubApp:
             page += 1
 
     async def review_bodies(self, repo: Repo, number: int, *, commit_sha: str, author: str) -> list[str]:
+        return [r.body for r in await self.posted_reviews(repo, number, author=author) if r.commit_sha == commit_sha]
+
+    async def posted_reviews(self, repo: Repo, number: int, *, author: str) -> list[PostedReview]:
         github = self._as_installation(repo.installation_id)
-        bodies: list[str] = []
+        found: list[PostedReview] = []
         page = 1
         while True:
-            # Raw JSON, not githubkit's models: only three fields matter and the full schema is large.
+            # Raw JSON, not githubkit's models: only a few fields matter and the full schema is large.
             response = await github.rest.pulls.async_list_reviews(
                 repo.owner, repo.name, number, per_page=100, page=page
             )
             reviews = response.json()
-            bodies += [
-                str(r.get("body") or "")
+            found += [
+                PostedReview(
+                    int(r.get("id") or 0),
+                    str(r.get("commit_id") or ""),
+                    cast(ReviewState, str(r.get("state") or "")),  # one GitHub adds later just never matches
+                    str(r.get("body") or ""),
+                )
                 for r in reviews
-                if (r.get("user") or {}).get("login") == author and r.get("commit_id") == commit_sha
+                if (r.get("user") or {}).get("login") == author
             ]
             if len(reviews) < 100:
-                return bodies
+                return found
             page += 1
+
+    async def dismiss_review(self, repo: Repo, number: int, review_id: int, *, message: str) -> None:
+        github = self._as_installation(repo.installation_id)
+        await github.rest.pulls.async_dismiss_review(repo.owner, repo.name, number, review_id, message=message)

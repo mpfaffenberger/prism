@@ -9,7 +9,15 @@ import pytest
 from autoreviewer.github import PostedComment, Repo
 from autoreviewer.review.job import review_and_post
 from autoreviewer.review.pipeline import Outcome, normal_title
-from autoreviewer.review.posting import Publisher, answer_markers, post_review, reconsider, withdrawals
+from autoreviewer.review.posting import (
+    STALE_REQUEST,
+    Publisher,
+    answer_markers,
+    post_review,
+    reconsider,
+    retire_stale_request,
+    withdrawals,
+)
 from autoreviewer.review.render import comment_body, posted_title
 from autoreviewer.review.schemas import Finding
 from autoreviewer.web.routing import PullRequestUpdated
@@ -131,6 +139,15 @@ async def test_approves_once_nothing_blocking_is_left_standing(repo: GitRepo) ->
     assert not await reconsider(github, REPO, 7, author=BOT, block_at=1)  # already approved: a replay is a no-op
 
 
+async def test_a_blocker_outdated_on_the_head_does_not_hold_back_its_approval(repo: GitRepo) -> None:
+    """From #68's refactor of standing_blockers: GitHub shows the second finding as outdated, so it was about older
+    code, and the head's review in full didn't find it again. Only the head's own blocker, withdrawn, counted."""
+    github = await reviewed(repo, blocking(5), blocking(9))
+    withdraw(github, 1)
+    github.review_comments[1]["outdated"] = True
+    assert await reconsider(github, REPO, 7, author=BOT, block_at=1)
+
+
 async def test_a_new_partial_review_prevents_approval_from_an_older_verdict(repo: GitRepo) -> None:
     github = await reviewed(repo, blocking(5))
     await post_review(
@@ -224,3 +241,76 @@ def test_a_posted_title_reads_back_as_written(title: str) -> None:
     root = PostedComment("stats.py", 5, f"{body}\n\n<!-- autoreviewer:{'0' * 16} p1 correctness -->", 1)
     answer = PostedComment("stats.py", 5, f"ok\n\n{answer_markers(9, withdrawn=True)}", 2, 1)
     assert [w.title for w in withdrawals([root, answer])] == [normal_title(title)]
+
+
+NEXT = "b" * 40
+"""A commit pushed after the review: the PR's head when the bot withdraws (#68)."""
+
+
+async def retire(github: FakeGitHub) -> bool:
+    return await retire_stale_request(github, REPO, 7, author=BOT, block_at=1)
+
+
+async def pushed_then_withdrawn(repo: GitRepo, *findings: Finding, cut_short: bool = False) -> FakeGitHub:
+    """Reviewed with `findings`, the author pushes again, and the bot withdraws the first finding (comment 1)."""
+    github = await reviewed(repo, *findings, cut_short=cut_short)
+    github.head_shas = [NEXT]
+    withdraw(github, 1)
+    return github
+
+
+async def test_a_withdrawal_after_a_push_dismisses_the_stale_request_without_approving(repo: GitRepo) -> None:
+    """#68: the head has no verdict yet, so reconsider can't approve it, and the request stayed in force."""
+    github = await pushed_then_withdrawn(repo, blocking(5), blocking(9, kind="dry"))  # DRY never blocks
+    assert not await reconsider(github, REPO, 7, author=BOT, block_at=1)
+    assert await retire(github)
+    [request] = github.reviews
+    assert request["dismissed"] == STALE_REQUEST and "not an approval" in STALE_REQUEST
+    assert github.checks == []  # the head's own check decides; no green check from a review that never ran
+    assert not await retire(github)  # a replay finds it dismissed and does nothing
+
+
+async def test_an_outdated_blocker_counts_as_cleared_only_when_the_bot_settled_it(repo: GitRepo) -> None:
+    """The code moved past the second finding. Only the bot settling its thread says it's fixed; a person
+    resolving it doesn't (only a withdrawal or a new review clears a blocker)."""
+    github = await pushed_then_withdrawn(repo, blocking(5), blocking(9))
+    github.review_comments[1]["outdated"] = True
+    assert not await retire(github)  # not yet judged fixed
+    github.resolved_threads.add("T2")
+    assert not await retire(github)  # resolved by a person
+    github.settled_threads.add("T2")
+    assert await retire(github)
+
+
+@pytest.mark.parametrize(
+    "why",
+    [
+        "the request is on the head",
+        "another blocker stands",
+        "a blocker has no thread",
+        "the review was partial",
+        "the pr is closed",
+        "an approval is in force",
+    ],
+)
+async def test_a_stale_request_stays_unless_nothing_it_stood_on_is_left(repo: GitRepo, why: str) -> None:
+    findings = (blocking(5), blocking(9)) if why == "another blocker stands" else (blocking(5),)
+    github = await pushed_then_withdrawn(repo, *findings, cut_short=why == "the review was partial")
+    if why == "a blocker has no thread":  # outside=1: nothing could withdraw that one
+        github.reviews[-1]["body"] = github.reviews[-1]["body"].replace("outside=0", "outside=1")
+    if why == "the request is on the head":
+        github.head_shas = [repo.head]  # reconsider's case: it approves instead
+    if why == "the pr is closed":
+        github.pr_state = "closed"
+    if why == "an approval is in force":
+        github.reviews.append({**github.reviews[-1], "event": "APPROVE", "commit_sha": NEXT})
+    assert not await retire(github)
+    assert all("dismissed" not in review for review in github.reviews)
+
+
+async def test_a_dismissal_github_refuses_leaves_the_pr_as_it_was(repo: GitRepo) -> None:
+    """A protected branch may limit who can dismiss: that is no reason to fail the answer that came before."""
+    github = await pushed_then_withdrawn(repo, blocking(5))
+    github.fail_dismissals = True
+    assert not await retire(github)
+    assert "dismissed" not in github.reviews[0]

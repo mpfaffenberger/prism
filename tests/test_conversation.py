@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -330,17 +331,23 @@ def test_the_bots_blind_recheck_uses_the_findings_own_checker(monkeypatch: pytes
 
 
 @pytest.mark.parametrize("block_at", [0, 2])
+@pytest.mark.parametrize("approved", [True, False])
 async def test_reconsidering_uses_the_bots_blocking_threshold(
-    repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_at: int
+    repo: GitRepo, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, block_at: int, approved: bool
 ) -> None:
-    """From the bot's review of #49: reconsider_verdict passes the threshold on, not a default."""
-    seen: list[int] = []
+    """From the bot's review of #49: reconsider_verdict passes the threshold on, not a default. From #68: a stale
+    request on an older commit is retired only when there was no head to approve."""
+    seen: list[tuple[str, int]] = []
 
-    async def record(*_: object, block_at: int, **__: object) -> bool:
-        seen.append(block_at)
-        return False
+    def record(step: str, result: bool) -> Callable[..., Awaitable[bool]]:
+        async def called(*_: object, block_at: int, **__: object) -> bool:
+            seen.append((step, block_at))
+            return result
 
-    monkeypatch.setattr(conversation, "reconsider", record)
+        return called
+
+    monkeypatch.setattr(conversation, "reconsider", record("approve", approved))
+    monkeypatch.setattr(conversation, "retire_stale_request", record("dismiss", True))
     github, reply = await thread_with_reply(repo)
-    await reconsider_verdict(replace(deps(github, repo, tmp_path, scripted("holds")), block_at=block_at), reply)
-    assert seen == [block_at]
+    done = await reconsider_verdict(replace(deps(github, repo, tmp_path, scripted("holds")), block_at=block_at), reply)
+    assert done and seen == [("approve", block_at)] + ([] if approved else [("dismiss", block_at)])

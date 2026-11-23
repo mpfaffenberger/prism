@@ -19,12 +19,14 @@ from autoreviewer.github import (
     Comparison,
     Conclusion,
     PostedComment,
+    PostedReview,
     PullRequestState,
     Reaction,
     Repo,
     ReviewComment,
     ReviewEvent,
     ReviewRejected,
+    ReviewState,
     ReviewThread,
     ThreadComment,
 )
@@ -44,6 +46,13 @@ BOT = "example-reviewer[bot]"
 
 BASE_SOURCE = "def average(xs):\n    total = 0\n    for x in xs:\n        total += x\n    return total / len(xs)\n"
 HEAD_SOURCE = "def average(xs):\n    total = 0\n    for x in xs:\n        total += x\n    return total / len(xs) - 1\n"
+
+
+_STATES: dict[str, ReviewState] = {
+    "APPROVE": "APPROVED",
+    "REQUEST_CHANGES": "CHANGES_REQUESTED",
+    "COMMENT": "COMMENTED",
+}
 
 
 @dataclass(frozen=True)
@@ -205,6 +214,8 @@ class FakeGitHub:
     fail_threads: bool = False
     """Make resolving or reopening a thread fail, like GitHub's GraphQL API on a bad day."""
     fail_posted_comments: int = 0
+    fail_dismissals: bool = False
+    """Make dismissing a review fail, like a protected branch that limits who may dismiss."""
     """How many reads of the PR's comments fail (like a transient 5xx) before they work again."""
     comment_delay: float = 0.0
     """Inline comments posted on their own, as findings are confirmed."""
@@ -323,6 +334,19 @@ class FakeGitHub:
             if c.get("in_reply_to") is None
         ]
 
+    async def posted_reviews(self, repo: Repo, number: int, *, author: str) -> list[PostedReview]:
+        """The verdicts, ids 1-based positions in `reviews` (the empty wrappers never decide anything)."""
+        return [
+            PostedReview(i, r["commit_sha"], "DISMISSED" if "dismissed" in r else _STATES[r["event"]], r["body"])
+            for i, r in enumerate(self.reviews, start=1)
+            if r["author"] == author
+        ]
+
+    async def dismiss_review(self, repo: Repo, number: int, review_id: int, *, message: str) -> None:
+        if self.fail_dismissals:
+            raise RuntimeError("403 Forbidden")
+        self.reviews[review_id - 1]["dismissed"] = message
+
     async def set_settled(self, repo: Repo, thread: ReviewThread, *, settled: bool) -> None:
         if self.fail_threads:
             raise RuntimeError("502 Bad Gateway")
@@ -351,7 +375,9 @@ class FakeGitHub:
 
     async def review_bodies(self, repo: Repo, number: int, *, commit_sha: str, author: str) -> list[str]:
         """Like GitHub: each single inline comment comes wrapped in an empty COMMENTED review of its own."""
-        verdicts = [r["body"] for r in self.reviews if r["commit_sha"] == commit_sha and r["author"] == author]
+        verdicts = [
+            r.body for r in await self.posted_reviews(repo, number, author=author) if r.commit_sha == commit_sha
+        ]
         wrappers = ["" for c in self.review_comments if c["commit_sha"] == commit_sha and c["author"] == author]
         return verdicts + wrappers
 
