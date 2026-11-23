@@ -78,6 +78,12 @@ event, how many blocking findings it listed with no thread to withdraw them in, 
 the whole change. A withdrawal only ever overturns a complete verdict that requested changes with outside=0."""
 
 
+def overturnable(verdict: re.Match[str] | None) -> bool:
+    """Whether a withdrawal may overturn this verdict state: a complete review that requested changes, with every
+    blocking finding in a thread a withdrawal could happen in (outside=0)."""
+    return verdict is not None and verdict.group(1, 2, 3) == ("REQUEST_CHANGES", "0", "1")
+
+
 Placement = tuple[str, int, str]
 """(path, line on the current head, kind): where GitHub shows a finding comment."""
 
@@ -369,8 +375,8 @@ async def reconsider(github: PullRequests, repo: Repo, number: int, *, author: s
     if state.state != "open":
         return False
     bodies = await github.review_bodies(repo, number, commit_sha=state.head_sha, author=author)
-    verdicts = [match.group(1, 2, 3) for body in bodies if (match := _VERDICT_STATE.search(body))]
-    if not verdicts or verdicts[-1] != ("REQUEST_CHANGES", "0", "1"):
+    verdicts = [match for body in bodies if (match := _VERDICT_STATE.search(body))]
+    if not verdicts or not overturnable(verdicts[-1]):
         return False
     if standing_blockers(await github.posted_comments(repo, number, author=author), block_at):
         return False
@@ -413,7 +419,7 @@ async def retire_stale_request(github: Conversations, repo: Repo, number: int, *
     ]
     if not decisive or (review := decisive[-1]).state != "CHANGES_REQUESTED" or review.commit_sha == state.head_sha:
         return False
-    if not (match := _VERDICT_STATE.search(review.body)) or match.group(1, 2, 3) != ("REQUEST_CHANGES", "0", "1"):
+    if not overturnable(_VERDICT_STATE.search(review.body)):
         return False
     comments = await github.posted_comments(repo, number, author=author)
     cleared = withdrawn_threads(comments).keys() | {

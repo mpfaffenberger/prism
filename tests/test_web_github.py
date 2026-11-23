@@ -106,7 +106,7 @@ class FakeGitHub:
                 {"user": {"login": BOT_LOGIN}, "commit_id": HEAD, "body": None},  # wraps a comment; fields missing
                 {"id": 33, "user": {"login": BOT_LOGIN}, "commit_id": "d" * 40, "state": "DISMISSED",
                  "body": "older head"},
-                {"id": 34, "user": {"login": "someone"}, "commit_id": HEAD, "state": "APPROVED", "body": "human"},
+                {"user": {"login": "someone"}, "commit_id": HEAD, "body": "human"},
             ])  # fmt: skip
         if method == "GET" and path == f"{base}/pulls/7/comments":
             return httpx2.Response(200, json=[

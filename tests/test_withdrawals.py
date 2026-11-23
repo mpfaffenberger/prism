@@ -247,8 +247,8 @@ NEXT = "b" * 40
 """A commit pushed after the review: the PR's head when the bot withdraws (#68)."""
 
 
-async def retire(github: FakeGitHub) -> bool:
-    return await retire_stale_request(github, REPO, 7, author=BOT, block_at=1)
+async def retire(github: FakeGitHub, *, block_at: int = 1) -> bool:
+    return await retire_stale_request(github, REPO, 7, author=BOT, block_at=block_at)
 
 
 async def pushed_then_withdrawn(repo: GitRepo, *findings: Finding, cut_short: bool = False) -> FakeGitHub:
@@ -306,6 +306,15 @@ async def test_a_stale_request_stays_unless_nothing_it_stood_on_is_left(repo: Gi
         github.reviews.append({**github.reviews[-1], "event": "APPROVE", "commit_sha": NEXT})
     assert not await retire(github)
     assert all("dismissed" not in review for review in github.reviews)
+
+
+@pytest.mark.parametrize(("block_at", "dismissed"), [(1, True), (2, False)])
+async def test_only_findings_at_the_bots_threshold_hold_a_stale_request(
+    repo: GitRepo, block_at: int, dismissed: bool
+) -> None:
+    """From the bot's review of #73: a P2 finding left standing is advice at block_at=1 and a blocker at 2."""
+    github = await pushed_then_withdrawn(repo, blocking(5), blocking(9, priority=2))
+    assert await retire(github, block_at=block_at) is dismissed
 
 
 async def test_a_dismissal_github_refuses_leaves_the_pr_as_it_was(repo: GitRepo) -> None:
