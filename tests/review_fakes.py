@@ -214,9 +214,9 @@ class FakeGitHub:
     fail_threads: bool = False
     """Make resolving or reopening a thread fail, like GitHub's GraphQL API on a bad day."""
     fail_posted_comments: int = 0
+    """How many reads of the PR's comments fail (like a transient 5xx) before they work again."""
     fail_dismissals: bool = False
     """Make dismissing a review fail, like a protected branch that limits who may dismiss."""
-    """How many reads of the PR's comments fail (like a transient 5xx) before they work again."""
     comment_delay: float = 0.0
     """Inline comments posted on their own, as findings are confirmed."""
     check_updates: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])

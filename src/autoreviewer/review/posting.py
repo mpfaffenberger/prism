@@ -407,10 +407,13 @@ async def retire_stale_request(github: Conversations, repo: Repo, number: int, *
     Without this the request stays in force until a later review posts a verdict, and one that times out never
     does (#68). Only a complete verdict with no blocker outside a thread (outside=0) qualifies, as for `reconsider`.
     Lines on an older commit can't be placed on the head, so every blocking finding comment the bot posted on the
-    PR, outdated or not, must be withdrawn in its thread or settled by the bot (it saw the code move past it); a
-    person resolving a thread doesn't count. Never an approval: the bot hasn't reviewed the head, and the head's
-    check still decides. True if it dismissed. Decided by code, never by the model; a replay finds the review
-    dismissed and does nothing."""
+    PR, outdated or not, must be withdrawn in its thread or settled: minimized as resolved, the bot's mark once a
+    review read that file in full for that kind and found nothing (settle_fixed; a cut-short review takes back
+    that coverage first). Resolving the thread on GitHub doesn't count, nor does a moderator hiding it. Anyone
+    with write access can also minimize a comment as resolved; they are trusted with the merge anyway.
+
+    Never an approval: the bot hasn't reviewed the head, and the head's check still decides. True if it
+    dismissed. Decided by code, never by the model; a replay finds the review dismissed and does nothing."""
     state = await github.get_pull(repo, number)
     if state.state != "open":
         return False

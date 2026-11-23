@@ -278,6 +278,8 @@ async def test_an_outdated_blocker_counts_as_cleared_only_when_the_bot_settled_i
     assert not await retire(github)  # not yet judged fixed
     github.resolved_threads.add("T2")
     assert not await retire(github)  # resolved by a person
+    github.hidden_threads.add("T2")
+    assert not await retire(github)  # hidden by a moderator, as spam or off-topic
     github.settled_threads.add("T2")
     assert await retire(github)
 
@@ -306,6 +308,16 @@ async def test_a_stale_request_stays_unless_nothing_it_stood_on_is_left(repo: Gi
         github.reviews.append({**github.reviews[-1], "event": "APPROVE", "commit_sha": NEXT})
     assert not await retire(github)
     assert all("dismissed" not in review for review in github.reviews)
+
+
+async def test_a_later_partial_verdict_leaves_the_request_in_force_and_still_retirable(repo: GitRepo) -> None:
+    """From the bot's review of #73: the newer commit's review was cut short, so its verdict only comments (#68's
+    own case). GitHub keeps the older request in force, and it is that request the bot dismisses."""
+    github = await pushed_then_withdrawn(repo, blocking(5))
+    await post_review(github, REPO, 7, head_sha=NEXT, author=BOT, models_note="m", outcome=Outcome(cut_short=True))
+    assert github.reviews[-1]["event"] == "COMMENT"
+    assert await retire(github)
+    assert "dismissed" in github.reviews[0] and "dismissed" not in github.reviews[-1]
 
 
 @pytest.mark.parametrize(("block_at", "dismissed"), [(1, True), (2, False)])
