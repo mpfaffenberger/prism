@@ -65,6 +65,9 @@ class PostedComment:
     id: int
     in_reply_to: int | None = None
     """The thread's first comment, for a reply; None for a comment that starts a thread."""
+    applies_at: str | None = None
+    """The last commit the comment applied to (GitHub's `commit_id`): the head while it's on the code, and once
+    it's outdated, the commit before the change that outdated it."""
 
 
 @dataclass(frozen=True)
@@ -425,6 +428,7 @@ class GitHubApp:
                 str(c.get("body") or ""),
                 int(c.get("id") or 0),
                 c.get("in_reply_to_id"),
+                c.get("commit_id"),
             )
             for c in await self._review_comments(repo, number)
             if (c.get("user") or {}).get("login") == author

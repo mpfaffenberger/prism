@@ -357,7 +357,8 @@ class FakeGitHub:
             self.hidden_threads.discard(thread.id)
 
     async def posted_comments(self, repo: Repo, number: int, *, author: str) -> list[PostedComment]:
-        """Like GitHub: a comment stays on its line on later heads unless marked `outdated`."""
+        """Like GitHub: a comment stays on its line on later heads unless marked `outdated`. An outdated one last
+        applied to the commit it was posted on, or to `applied_until` if a test sets it."""
         if self.fail_posted_comments:
             self.fail_posted_comments -= 1
             raise RuntimeError("502 Bad Gateway")
@@ -368,6 +369,7 @@ class FakeGitHub:
                 c["comment"].body,
                 i,
                 c.get("in_reply_to"),
+                c.get("applied_until", c.get("commit_sha")) if c.get("outdated") else self.repo.head,
             )
             for i, c in enumerate(self.review_comments, start=1)
             if c["author"] == author

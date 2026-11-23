@@ -270,18 +270,30 @@ async def test_a_withdrawal_after_a_push_dismisses_the_stale_request_without_app
     assert not await retire(github)  # a replay finds it dismissed and does nothing
 
 
-async def test_an_outdated_blocker_counts_as_cleared_only_when_the_bot_settled_it(repo: GitRepo) -> None:
-    """The code moved past the second finding. Only the bot settling its thread says it's fixed; a person
-    resolving it doesn't (only a withdrawal or a new review clears a blocker)."""
+@pytest.mark.parametrize(
+    ("applied_until", "dismissed"),
+    [
+        ("the request's commit", False),  # the request stood on it; the code moved past it only later
+        ("an earlier commit", True),  # outdated before the request, whose complete review judged it
+        ("a commit GitHub forgot", False),  # rewritten history: can't tell, so it still counts
+        ("no commit on record", False),
+    ],
+)
+async def test_an_outdated_blocker_holds_the_request_unless_it_was_outdated_before_it(
+    repo: GitRepo, applied_until: str, dismissed: bool
+) -> None:
+    """From the bot's review of #73: the code moving past a blocker after the request proves nothing until a
+    complete review checks it, and a thread marked settled, by whoever, doesn't stand in for that."""
     github = await pushed_then_withdrawn(repo, blocking(5), blocking(9))
     github.review_comments[1]["outdated"] = True
-    assert not await retire(github)  # not yet judged fixed
-    github.resolved_threads.add("T2")
-    assert not await retire(github)  # resolved by a person
-    github.hidden_threads.add("T2")
-    assert not await retire(github)  # hidden by a moderator, as spam or off-topic
-    github.settled_threads.add("T2")
-    assert await retire(github)
+    github.review_comments[1]["applied_until"] = {
+        "the request's commit": repo.head,
+        "an earlier commit": repo.base,
+        "a commit GitHub forgot": "e" * 40,
+        "no commit on record": None,
+    }[applied_until]
+    github.settled_threads.add("T2")  # as a later, partial review's settle_fixed would
+    assert await retire(github) is dismissed
 
 
 @pytest.mark.parametrize(
@@ -289,6 +301,7 @@ async def test_an_outdated_blocker_counts_as_cleared_only_when_the_bot_settled_i
     [
         "the request is on the head",
         "another blocker stands",
+        "a later review's blocker stands",
         "a blocker has no thread",
         "the review was partial",
         "the pr is closed",
@@ -298,6 +311,8 @@ async def test_an_outdated_blocker_counts_as_cleared_only_when_the_bot_settled_i
 async def test_a_stale_request_stays_unless_nothing_it_stood_on_is_left(repo: GitRepo, why: str) -> None:
     findings = (blocking(5), blocking(9)) if why == "another blocker stands" else (blocking(5),)
     github = await pushed_then_withdrawn(repo, *findings, cut_short=why == "the review was partial")
+    if why == "a later review's blocker stands":  # posted on the new head by a review that didn't finish
+        await Publisher(github, REPO, 7, head_sha=NEXT, author=BOT, block_at=1)(blocking(12))
     if why == "a blocker has no thread":  # outside=1: nothing could withdraw that one
         github.reviews[-1]["body"] = github.reviews[-1]["body"].replace("outside=0", "outside=1")
     if why == "the request is on the head":

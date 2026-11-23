@@ -110,7 +110,8 @@ class FakeGitHub:
             ])  # fmt: skip
         if method == "GET" and path == f"{base}/pulls/7/comments":
             return httpx2.Response(200, json=[
-                {"id": 11, "user": {"login": BOT_LOGIN}, "path": "f1.py", "line": 7, "body": f"finding {MARKER}"},
+                {"id": 11, "user": {"login": BOT_LOGIN}, "path": "f1.py", "line": 7, "body": f"finding {MARKER}",
+                 "commit_id": HEAD},
                 {"id": 12, "user": {"login": BOT_LOGIN}, "path": "f2.py", "line": None, "original_line": 3,
                  "body": "outdated"},
                 {"id": 13, "in_reply_to_id": 11, "user": {"login": "someone"}, "path": "f1.py", "line": 7,
@@ -271,7 +272,7 @@ async def test_single_comments_and_review_listings(fake_and_app: tuple[FakeGitHu
     assert fake.writes[-1] == ("dismiss_review", "/repos/mpfaffenberger/demo/pulls/7/reviews/31/dismissals",
                                {"message": "stale"})  # fmt: skip
     assert await app.posted_comments(REPO, 7, author=BOT_LOGIN) == [
-        PostedComment("f1.py", 7, f"finding {MARKER}", 11),
+        PostedComment("f1.py", 7, f"finding {MARKER}", 11, applies_at=HEAD),
         PostedComment("f2.py", None, "outdated", 12),
     ]
 

@@ -16,6 +16,7 @@ from dataclasses import replace
 from typing import cast
 
 from autoreviewer.github import (
+    CommitNotFound,
     Conversations,
     PostedComment,
     PullRequests,
@@ -395,22 +396,22 @@ async def reconsider(github: PullRequests, repo: Repo, number: int, *, author: s
 DECISIVE: frozenset[ReviewState] = frozenset({"APPROVED", "CHANGES_REQUESTED", "DISMISSED"})
 """The review states that set a reviewer's decision on GitHub: its latest such review is the one in force."""
 STALE_REQUEST = (
-    "Every blocking finding of this review was withdrawn in its thread after a re-check of the code, or the code "
-    "moved past it. This is not an approval: the newer commit gets its own review."
+    "Every blocking finding of this review was withdrawn in its thread after a re-check of the code. "
+    "This is not an approval: the newer commit gets its own review."
 )
 
 
 async def retire_stale_request(github: Conversations, repo: Repo, number: int, *, author: str, block_at: int) -> bool:
     """After a withdrawal, once the PR has moved past the commit the bot requested changes on: dismiss that review
-    if nothing it could have stood on is left. `reconsider` handles a request on the head itself, by approving.
+    if every blocking finding it could have stood on, and any posted since, is withdrawn in its thread.
+    `reconsider` handles a request on the head itself, by approving.
 
     Without this the request stays in force until a later review posts a verdict, and one that times out never
-    does (#68). Only a complete verdict with no blocker outside a thread (outside=0) qualifies, as for `reconsider`.
-    Lines on an older commit can't be placed on the head, so every blocking finding comment the bot posted on the
-    PR, outdated or not, must be withdrawn in its thread or settled: minimized as resolved, the bot's mark once a
-    review read that file in full for that kind and found nothing (settle_fixed; a cut-short review takes back
-    that coverage first). Resolving the thread on GitHub doesn't count, nor does a moderator hiding it. Anyone
-    with write access can also minimize a comment as resolved; they are trusted with the merge anyway.
+    does (#68). Only a complete verdict with no blocker outside a thread qualifies, as for `reconsider`. A
+    complete verdict judged every comment GitHub still showed on its commit, so only comments outdated before that
+    commit are past it (`_outdated_before`). Nothing else clears a blocker: not the code moving past it later (no
+    complete review has checked that, or its verdict would be the one in force), and not a thread marked settled
+    or resolved, which a later partial review, a moderator or a maintainer can do.
 
     Never an approval: the bot hasn't reviewed the head, and the head's check still decides. True if it
     dismissed. Decided by code, never by the model; a replay finds the review dismissed and does nothing."""
@@ -425,11 +426,10 @@ async def retire_stale_request(github: Conversations, repo: Repo, number: int, *
     if not overturnable(_VERDICT_STATE.search(review.body)):
         return False
     comments = await github.posted_comments(repo, number, author=author)
-    cleared = withdrawn_threads(comments).keys() | {
-        thread.root_comment_id for thread in await github.review_threads(repo, number) if thread.settled
-    }
-    if any(comment.id not in cleared for comment, _ in blocking_findings(comments, block_at)):
-        return False
+    withdrawn = withdrawn_threads(comments)
+    for comment, _ in blocking_findings(comments, block_at):
+        if comment.id not in withdrawn and not await _outdated_before(github, repo, comment, review.commit_sha):
+            return False
     try:
         await github.dismiss_review(repo, number, review.id, message=STALE_REQUEST)
     except Exception:  # e.g. a protected branch that limits who may dismiss: the PR is just left as it was
@@ -440,6 +440,17 @@ async def retire_stale_request(github: Conversations, repo: Repo, number: int, *
     logger.info("%s/%s#%d: dismissed review %d at %s after withdrawals", repo.owner, repo.name, number, review.id,
                 review.commit_sha[:7])  # fmt: skip
     return True
+
+
+async def _outdated_before(github: Conversations, repo: Repo, comment: PostedComment, commit: str) -> bool:
+    """Whether GitHub stopped showing `comment` on the code before `commit`: the last commit it applied to is a
+    strict ancestor of it. False when unsure (no record of that commit, or one GitHub no longer knows)."""
+    if comment.applies_at is None:
+        return False
+    try:
+        return (await github.compare(repo, comment.applies_at, commit)).status == "ahead"
+    except CommitNotFound:  # rewritten history: can't tell, so it still counts
+        return False
 
 
 async def settle_fixed(
